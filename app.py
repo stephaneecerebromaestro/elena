@@ -444,6 +444,43 @@ def vapi_server_url():
 
             return jsonify({"result": json.dumps(result, ensure_ascii=False)}), 200, cors
 
+        elif message_type == "assistant-request":
+            # Inject today's date into the system prompt so Elena knows what day it is
+            now = datetime.now(TZ)
+            days_es = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+            months_es = ["enero", "febrero", "marzo", "abril", "mayo", "junio",
+                         "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+            tomorrow = now + timedelta(days=1)
+            today_str = f"{days_es[now.weekday()]} {now.day} de {months_es[now.month-1]} de {now.year}"
+            tomorrow_str = f"{days_es[tomorrow.weekday()]} {tomorrow.day} de {months_es[tomorrow.month-1]} de {tomorrow.year}"
+
+            date_context = f"""\n\n## Fecha y Hora Actual (CRÍTICO)
+**HOY es {today_str}.** La zona horaria es Miami (Eastern Time).
+**MAÑANA es {tomorrow_str}.**
+Cuando el cliente diga "mañana", se refiere al {tomorrow.day} de {months_es[tomorrow.month-1]}.
+Cuando el cliente diga "hoy", se refiere al {now.day} de {months_es[now.month-1]}.
+USA SIEMPRE estas fechas como referencia al interpretar lo que dice el cliente."""
+
+            # Read the base system prompt from file or use stored version
+            base_prompt_path = os.path.join(os.path.dirname(__file__), "system_prompt.txt")
+            if os.path.exists(base_prompt_path):
+                with open(base_prompt_path, "r", encoding="utf-8") as f:
+                    base_prompt = f.read()
+            else:
+                base_prompt = "Eres Elena, asistente de Laser Place Miami."
+
+            full_prompt = base_prompt + date_context
+
+            return jsonify({
+                "assistant": {
+                    "model": {
+                        "provider": "openai",
+                        "model": "gpt-4o",
+                        "messages": [{"role": "system", "content": full_prompt}]
+                    }
+                }
+            }), 200, cors
+
         elif message_type in ["status-update", "end-of-call-report", "hang", "speech-update", "transcript"]:
             return jsonify({"status": "ok"}), 200, cors
 
