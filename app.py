@@ -209,7 +209,7 @@ def handle_create_contact(args):
 
 
 def handle_create_booking(args):
-    """Create a new appointment in GHL calendar using V1 API."""
+    """Create a new appointment in GHL calendar using V2 API with PIT."""
     contact_id = args.get("contactId", "")
     start_time = args.get("startTime", "")
     title = args.get("title", "Evaluación Botox - Laser Place Miami")
@@ -217,16 +217,27 @@ def handle_create_booking(args):
     if not contact_id or not start_time:
         return {"success": False, "message": "Se necesita contactId y startTime para agendar."}
 
+    # Calculate end time (30 min after start)
+    try:
+        dt_start = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+        dt_end = dt_start + timedelta(minutes=30)
+        end_time = dt_end.isoformat()
+    except Exception:
+        end_time = start_time  # fallback
+
     data = {
         "calendarId": CALENDAR_ID,
+        "locationId": LOCATION_ID,
         "contactId": contact_id,
         "startTime": start_time,
+        "endTime": end_time,
         "title": title,
         "appointmentStatus": "confirmed",
-        "locationId": LOCATION_ID
+        "selectedTimezone": "America/New_York",
+        "selectedSlot": start_time
     }
 
-    result = ghl_v1_post("appointments/", data)
+    result = ghl_v2_post("/calendars/events/appointments", data)
 
     if "id" in result or "appointment" in result:
         appt = result if "id" in result else result.get("appointment", {})
@@ -235,7 +246,7 @@ def handle_create_booking(args):
             "appointmentId": appt.get("id", ""),
             "message": f"Cita agendada exitosamente para {start_time}. ID: {appt.get('id', '')}"
         }
-    return {"success": False, "message": f"No se pudo agendar: {str(result)[:200]}"}
+    return {"success": False, "message": f"No se pudo agendar: {str(result)[:300]}"}
 
 
 def handle_reschedule_appointment(args):
