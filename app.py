@@ -1,14 +1,16 @@
 """
 Elena AI - Vapi Tool Server for GoHighLevel
-Standalone Flask server for deployment on Render/Railway/any cloud platform.
+Standalone Flask server for deployment on Render.
+
+Uses GHL V2 API (services.leadconnectorhq.com) with Private Integration Token (PIT).
 
 Handles tool calls from Vapi during live phone conversations:
-- check_availability: Check calendar availability
+- check_availability: Check calendar availability (next 14 days)
+- get_contact: Search contact by phone number
+- create_contact: Create a new contact
 - create_booking: Create a new appointment
 - reschedule_appointment: Reschedule an existing appointment
 - cancel_appointment: Cancel an existing appointment
-- get_contact: Get contact by phone number
-- create_contact: Create a new contact
 - get_appointment_by_contact: Find upcoming appointments for a contact
 """
 
@@ -17,97 +19,146 @@ import requests as http_requests
 import json
 import os
 from datetime import datetime, timedelta
+import pytz
 
 app = Flask(__name__)
 
-# Configuration from environment variables
-GHL_API_KEY = os.environ.get("GHL_API_KEY", "")
-GHL_BASE_URL = "https://rest.gohighlevel.com/v1"
+# ─── Configuration ────────────────────────────────────────────────────────────
+GHL_PIT = os.environ.get("GHL_PIT", "")           # Private Integration Token
+GHL_API_KEY = os.environ.get("GHL_API_KEY", "")   # Legacy JWT key (fallback)
 CALENDAR_ID = os.environ.get("GHL_CALENDAR_ID", "hYHvVwjKPykvcPkrsQWT")
 LOCATION_ID = os.environ.get("GHL_LOCATION_ID", "hzRj7DV9erP8tnPiTv7D")
 
+GHL_V2_BASE = "https://services.leadconnectorhq.com"
+GHL_V1_BASE = "https://rest.gohighlevel.com/v1"
+TZ = pytz.timezone("America/New_York")
 
-def ghl_headers():
+
+def v2_headers():
+    """Headers for GHL V2 API using PIT."""
+    token = GHL_PIT or GHL_API_KEY
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Version": "2021-04-15"
+    }
+
+
+def v1_headers():
+    """Headers for GHL V1 API using legacy JWT."""
     return {
         "Authorization": f"Bearer {GHL_API_KEY}",
         "Content-Type": "application/json"
     }
 
 
-def ghl_get(endpoint, params=None):
-    url = f"{GHL_BASE_URL}/{endpoint}"
-    resp = http_requests.get(url, headers=ghl_headers(), params=params, timeout=10)
+def ghl_v2_get(path, params=None):
+    url = f"{GHL_V2_BASE}{path}"
+    resp = http_requests.get(url, headers=v2_headers(), params=params, timeout=12)
     return resp.json()
 
 
-def ghl_post(endpoint, data):
-    url = f"{GHL_BASE_URL}/{endpoint}"
-    resp = http_requests.post(url, headers=ghl_headers(), json=data, timeout=10)
+def ghl_v2_post(path, data):
+    url = f"{GHL_V2_BASE}{path}"
+    resp = http_requests.post(url, headers=v2_headers(), json=data, timeout=12)
     return resp.json()
 
 
-def ghl_put(endpoint, data):
-    url = f"{GHL_BASE_URL}/{endpoint}"
-    resp = http_requests.put(url, headers=ghl_headers(), json=data, timeout=10)
+def ghl_v2_put(path, data):
+    url = f"{GHL_V2_BASE}{path}"
+    resp = http_requests.put(url, headers=v2_headers(), json=data, timeout=12)
     return resp.json()
 
 
-# ─── Tool Handlers ───────────────────────────────────────────────────────────
+def ghl_v1_get(endpoint, params=None):
+    url = f"{GHL_V1_BASE}/{endpoint}"
+    resp = http_requests.get(url, headers=v1_headers(), params=params, timeout=12)
+    return resp.json()
+
+
+def ghl_v1_post(endpoint, data):
+    url = f"{GHL_V1_BASE}/{endpoint}"
+    resp = http_requests.post(url, headers=v1_headers(), json=data, timeout=12)
+    return resp.json()
+
+
+def ghl_v1_put(endpoint, data):
+    url = f"{GHL_V1_BASE}/{endpoint}"
+    resp = http_requests.put(url, headers=v1_headers(), json=data, timeout=12)
+    return resp.json()
+
+
+# ─── Tool Handlers ────────────────────────────────────────────────────────────
 
 def handle_check_availability(args):
-    """Check available appointment slots for the next 14 days."""
-    now = datetime.utcnow()
+    """Check available appointment slots for the next 14 days using V2 API."""
+    now = datetime.now(TZ)
     start_ms = int(now.timestamp() * 1000)
     end_ms = int((now + timedelta(days=14)).timestamp() * 1000)
 
-    result = ghl_get("appointments/slots", {
-        "calendarId": CALENDAR_ID,
-        "startDate": start_ms,
-        "endDate": end_ms,
-        "timezone": "America/New_York"
-    })
+    result = ghl_v2_get(
+        f"/calendars/{CALENDAR_ID}/free-slots",
+        params={
+            "startDate": start_ms,
+            "endDate": end_ms,
+            "timezone": "America/New_York"
+        }
+    )
 
-    slots = result.get("slots", result) if isinstance(result, dict) else result
+    # Parse the response - V2 returns {date: {slots: [...]}}
     formatted_slots = []
-
-    if isinstance(slots, dict):
-        for date_key, day_slots in sorted(slots.items()):
-            if isinstance(day_slots, list):
-                for slot in day_slots[:4]:
-                    formatted_slots.append({"date": date_key, "time": slot})
-            elif isinstance(day_slots, dict) and "slots" in day_slots:
-                for slot in day_slots["slots"][:4]:
-                    formatted_slots.append({"date": date_key, "time": slot})
-    elif isinstance(slots, list):
-        formatted_slots = slots[:20]
-
     tuesday_slots = []
     other_slots = []
-    for slot in formatted_slots:
-        slot_str = json.dumps(slot).lower()
-        if "tue" in slot_str or "martes" in slot_str:
-            tuesday_slots.append(slot)
-        else:
-            other_slots.append(slot)
 
-    return {
-        "available": len(formatted_slots) > 0,
-        "tuesday_slots": tuesday_slots[:5],
-        "other_slots": other_slots[:10],
-        "total_available": len(formatted_slots),
-        "message": "Horarios disponibles encontrados. Prioriza ofrecer los martes."
-        if formatted_slots else "No hay horarios disponibles en los próximos 14 días."
-    }
+    if isinstance(result, dict):
+        for date_key, day_data in sorted(result.items()):
+            if isinstance(day_data, dict) and "slots" in day_data:
+                slots_list = day_data["slots"]
+            elif isinstance(day_data, list):
+                slots_list = day_data
+            else:
+                continue
+
+            for slot in slots_list[:5]:  # max 5 per day
+                slot_entry = {"date": date_key, "time": slot}
+                formatted_slots.append(slot_entry)
+
+                # Check if it's Tuesday
+                try:
+                    dt = datetime.fromisoformat(slot.replace("Z", "+00:00"))
+                    if dt.weekday() == 1:  # Tuesday = 1
+                        tuesday_slots.append(slot_entry)
+                    else:
+                        other_slots.append(slot_entry)
+                except Exception:
+                    other_slots.append(slot_entry)
+
+    if formatted_slots:
+        return {
+            "available": True,
+            "tuesday_slots": tuesday_slots[:5],
+            "other_slots": other_slots[:10],
+            "total_available": len(formatted_slots),
+            "message": "Horarios disponibles encontrados. Prioriza ofrecer los martes."
+        }
+    else:
+        return {
+            "available": False,
+            "tuesday_slots": [],
+            "other_slots": [],
+            "total_available": 0,
+            "message": "No hay horarios disponibles en los próximos 14 días.",
+            "raw_response": str(result)[:200]
+        }
 
 
 def handle_get_contact(args):
-    """Search for a contact by phone number."""
+    """Search for a contact by phone number using V1 API."""
     phone = args.get("phone", "")
     if not phone:
         return {"found": False, "message": "Número de teléfono no proporcionado."}
 
     phone_clean = phone.replace("-", "").replace(" ", "").replace("(", "").replace(")", "")
-    # Ensure +1 prefix for US numbers
     if not phone_clean.startswith("+"):
         phone_clean = phone_clean.lstrip("0")
         if len(phone_clean) == 10:
@@ -117,7 +168,7 @@ def handle_get_contact(args):
         else:
             phone_clean = "+" + phone_clean
 
-    result = ghl_get("contacts/lookup", {"phone": phone_clean})
+    result = ghl_v1_get("contacts/lookup", {"phone": phone_clean})
 
     if "contacts" in result and len(result["contacts"]) > 0:
         contact = result["contacts"][0]
@@ -134,7 +185,7 @@ def handle_get_contact(args):
 
 
 def handle_create_contact(args):
-    """Create a new contact in GHL."""
+    """Create a new contact in GHL using V1 API."""
     data = {
         "locationId": LOCATION_ID,
         "firstName": args.get("firstName", ""),
@@ -145,7 +196,7 @@ def handle_create_contact(args):
     if args.get("email"):
         data["email"] = args["email"]
 
-    result = ghl_post("contacts/", data)
+    result = ghl_v1_post("contacts/", data)
 
     if "contact" in result:
         contact = result["contact"]
@@ -158,10 +209,10 @@ def handle_create_contact(args):
 
 
 def handle_create_booking(args):
-    """Create a new appointment in GHL calendar."""
+    """Create a new appointment in GHL calendar using V1 API."""
     contact_id = args.get("contactId", "")
     start_time = args.get("startTime", "")
-    title = args.get("title", "Consulta Botox - Laser Place Miami")
+    title = args.get("title", "Evaluación Botox - Laser Place Miami")
 
     if not contact_id or not start_time:
         return {"success": False, "message": "Se necesita contactId y startTime para agendar."}
@@ -175,7 +226,7 @@ def handle_create_booking(args):
         "locationId": LOCATION_ID
     }
 
-    result = ghl_post("appointments/", data)
+    result = ghl_v1_post("appointments/", data)
 
     if "id" in result or "appointment" in result:
         appt = result if "id" in result else result.get("appointment", {})
@@ -188,7 +239,7 @@ def handle_create_booking(args):
 
 
 def handle_reschedule_appointment(args):
-    """Reschedule an existing appointment to a new time."""
+    """Reschedule an existing appointment to a new time using V1 API."""
     appointment_id = args.get("appointmentId", "")
     new_start_time = args.get("newStartTime", "")
 
@@ -197,7 +248,7 @@ def handle_reschedule_appointment(args):
     if not new_start_time:
         return {"success": False, "message": "Se necesita el nuevo horario (newStartTime) para reagendar."}
 
-    result = ghl_put(f"appointments/{appointment_id}", {"startTime": new_start_time})
+    result = ghl_v1_put(f"appointments/{appointment_id}", {"startTime": new_start_time})
 
     if "id" in result or "appointment" in result:
         return {
@@ -210,12 +261,12 @@ def handle_reschedule_appointment(args):
 
 
 def handle_cancel_appointment(args):
-    """Cancel an existing appointment."""
+    """Cancel an existing appointment using V1 API."""
     appointment_id = args.get("appointmentId", "")
     if not appointment_id:
         return {"success": False, "message": "Se necesita el appointmentId para cancelar."}
 
-    result = ghl_put(f"appointments/{appointment_id}", {"appointmentStatus": "cancelled"})
+    result = ghl_v1_put(f"appointments/{appointment_id}", {"appointmentStatus": "cancelled"})
 
     if "id" in result or "appointment" in result:
         return {"success": True, "appointmentId": appointment_id, "message": "Cita cancelada exitosamente."}
@@ -223,7 +274,7 @@ def handle_cancel_appointment(args):
 
 
 def handle_get_appointment_by_contact(args):
-    """Get upcoming appointments for a contact (needed before rescheduling)."""
+    """Get upcoming appointments for a contact using V1 API."""
     contact_id = args.get("contactId", "")
     if not contact_id:
         return {"found": False, "message": "Se necesita el contactId para buscar citas."}
@@ -232,7 +283,7 @@ def handle_get_appointment_by_contact(args):
     start_ms = int(now.timestamp() * 1000)
     end_ms = int((now + timedelta(days=60)).timestamp() * 1000)
 
-    result = ghl_get("appointments/", {
+    result = ghl_v1_get("appointments/", {
         "calendarId": CALENDAR_ID,
         "startDate": start_ms,
         "endDate": end_ms
@@ -254,7 +305,7 @@ def handle_get_appointment_by_contact(args):
     return {"found": False, "message": "No se encontraron citas próximas para este contacto."}
 
 
-# ─── Tool Registry ───────────────────────────────────────────────────────────
+# ─── Tool Registry ────────────────────────────────────────────────────────────
 
 TOOL_HANDLERS = {
     "check_availability": handle_check_availability,
@@ -267,7 +318,7 @@ TOOL_HANDLERS = {
 }
 
 
-# ─── Vapi Server URL Endpoint ───────────────────────────────────────────────
+# ─── Vapi Server URL Endpoint ─────────────────────────────────────────────────
 
 @app.route("/api/vapi/server-url", methods=["POST", "OPTIONS", "GET"])
 def vapi_server_url():
@@ -286,7 +337,8 @@ def vapi_server_url():
             "status": "healthy",
             "service": "Elena AI - Vapi Tool Server",
             "tools": list(TOOL_HANDLERS.keys()),
-            "calendar_id": CALENDAR_ID
+            "calendar_id": CALENDAR_ID,
+            "using_pit": bool(GHL_PIT)
         }), 200, cors
 
     try:
@@ -358,7 +410,12 @@ def vapi_server_url():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "healthy", "service": "Elena AI Tool Server"})
+    return jsonify({
+        "status": "healthy",
+        "service": "Elena AI Tool Server",
+        "using_pit": bool(GHL_PIT),
+        "calendar_id": CALENDAR_ID
+    })
 
 
 if __name__ == "__main__":
