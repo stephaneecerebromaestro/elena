@@ -1100,11 +1100,11 @@ def _process_end_of_call(message):
         else:
             call_type = "Outbound"  # default for backwards compatibility
 
-        # ── Step 1: Detect tool call outcomes (create_booking + schedule_callback) ──
+        # ── Step 1: Detect tool call outcomes (create_booking + schedule_callback + request_human_handoff) ──
         # FIX N: scan messages for BOTH create_booking and schedule_callback results.
         # schedule_callback success is the ground truth for llamar_luego — more reliable
         # than keyword matching, which misses natural speech variations.
-        # Priority: agendo > llamar_luego_confirmed > keyword fallback.
+        # Priority: agendo > seguimiento_humano > llamar_luego_confirmed > keyword fallback.
         agendo = False
         appointment_id = ""
         booked_time = ""
@@ -1114,6 +1114,9 @@ def _process_end_of_call(message):
                                         # outcome branches. Without this, Python raises UnboundLocalError
                                         # in branches that don't go through silence-timed-out,
                                         # crashing the entire end-of-call handler before writing to GHL.
+        # Detect request_human_handoff tool call — any format Vapi may use
+        messages_json = json.dumps(messages_list)
+        human_handoff_requested = "request_human_handoff" in messages_json
 
         for msg in messages_list:
             # ── Helper: parse a tool result dict from any message format ──────
@@ -1324,6 +1327,12 @@ def _process_end_of_call(message):
             outcome = "agendo"
             outcome_label = "Agendó"
             stage = "Consulta Agendada"
+        elif human_handoff_requested and not agendo:
+            # Patient explicitly requested human agent — second highest priority
+            outcome = "seguimiento_humano"
+            outcome_label = "Seguimiento Humano"
+            stage = "Seguimiento Humano"
+            print("[outcome] seguimiento_humano — patient requested human handoff via tool")
         elif llamar_luego_confirmed and not (
             short_call or voicemail_by_elena or voicemail_by_customer
             or ended_reason in ("customer-did-not-answer", "voicemail", "no-answer", "customer-busy")
@@ -1633,6 +1642,11 @@ def _process_end_of_call(message):
             # its branch so it can re-trigger on the next call. The Lead Nuevo workflow reads
             # elena_last_outcome (not the tag) to decide which branch to take.
             _update_contact_custom_field(contact_id, "elena_last_outcome", outcome)
+            # When human handoff is requested, also write elena_chat_last_outcome so
+            # Elena Chat gate stops responding to this contact automatically
+            if outcome == "seguimiento_humano":
+                _update_contact_custom_field(contact_id, "elena_chat_last_outcome", "seguimiento_humano")
+                print(f"[outcome] elena_chat_last_outcome=seguimiento_humano written for {contact_id}")
             _treatment = get_assistant_config(_eoc_assistant_id).get("treatment", "botox")
             _add_tag_to_contact(contact_id, f"elena_resultado_{_treatment}")
             # Save full transcript as a note on the GHL contact
