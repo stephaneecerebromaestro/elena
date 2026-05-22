@@ -149,6 +149,59 @@ VERIFICANDO_PHRASES = [
     "one moment please", "just a moment"
 ]
 
+LLAMAR_LUEGO_KEYWORDS = [
+    # Direct requests
+    "llámame luego", "llama luego", "llámame después", "llama después",
+    "llámame más tarde", "llama más tarde", "llamar más tarde",
+    "llámame mañana", "llama mañana",
+    # Variations with 'me'
+    "llamarme después", "llamarme más tarde", "llamarme luego",
+    "me llamas después", "me llamas más tarde", "me llamas luego",
+    "me llamas mañana", "me puedes llamar", "puedes llamarme",
+    "me puedes marcar", "puedes marcarme", "me marcas después",
+    "me marcas más tarde", "me marcas luego", "me marcas mañana",
+    # Availability expressions
+    "en otro momento", "ahora no puedo", "ahora mismo no",
+    "no es buen momento", "no tengo tiempo ahora",
+    "estoy ocupada", "estoy ocupado",
+    "ahora estoy ocupada", "ahora estoy ocupado",
+    "ahorita no puedo", "ahorita no", "ahorita estoy",
+    "ocupadita", "ocupadito",
+    "estoy en algo", "estoy en una reunión", "estoy en el trabajo",
+    "estoy manejando", "estoy conduciendo", "estoy en clase",
+    "no puedo hablar ahora", "no puedo hablar en este momento",
+    "este no es buen momento", "no es un buen momento",
+    # Indirect / soft refusals
+    "después te llamo", "te marco después", "yo te llamo",
+    "luego te llamo", "te llamo yo", "te llamo después",
+    "te llamo más tarde", "te llamo mañana",
+    "déjame llamarte", "déjame marcarte",
+    # Future time references
+    "la semana que viene", "la próxima semana", "llámame la próxima",
+    "en unos días", "más adelante", "en otro rato",
+    "pasado mañana", "esta tarde", "esta noche",
+    # Time-based (client accepted callback offer)
+    "en 2 horas", "en dos horas", "en 4 horas", "en cuatro horas",
+    "en 12 horas", "mañana me llamas", "mañana en la mañana", "mañana en la tarde",
+    # Spanglish / Miami Spanish
+    "call me later", "call me back", "call me tomorrow",
+    "llámame back", "llama me back", "call me after",
+    "i'm busy", "i am busy", "i can't talk", "can't talk right now",
+    "text me", "mándame un text",
+]
+
+NO_INTERESADO_PHRASES = [
+    "no me interesa", "no me interesa el botox", "no me interesa el tratamiento",
+    "no quiero", "no quiero botox", "no quiero el tratamiento", "no quiero nada",
+    "no gracias", "no, gracias", "no thank you", "no thanks",
+    "not interested", "no interest",
+    "no estoy interesada", "no estoy interesado",
+    "no me llames más", "no me llames", "no me vuelvas a llamar",
+    "quítame de tu lista", "remove me from", "don't call me", "do not call me",
+    "no necesito", "no necesito botox", "no necesito nada",
+    "no me interesa por ahora", "por ahora no me interesa",
+]
+
 SERVER_VERSION = "v17.57"  # FIX G1: ARIA lee GHL post-Claude (elimina race condition discrepancia)
                            # FIX C2: Telegram independiente de Supabase — ARIA notifica aunque upsert falle
 
@@ -950,6 +1003,20 @@ def _add_note_to_contact(contact_id, note_body):
     except Exception:
         return False
 
+
+def _parse_callback_hours(transcript_lower: str) -> int:
+    """Parse callback hours from transcript. Returns default 12 if no specific time found."""
+    if any(k in transcript_lower for k in ["en 2 hora", "en dos hora", "2 horas", "dos horas", "in 2 hour", "in two hour"]):
+        return 2
+    if any(k in transcript_lower for k in ["en 4 hora", "en cuatro hora", "4 horas", "cuatro horas", "esta tarde", "this afternoon", "in 4 hour"]):
+        return 4
+    if any(k in transcript_lower for k in ["mañana", "tomorrow", "tomorrow morning", "mañana en la mañana", "mañana en la tarde"]):
+        return 12
+    if any(k in transcript_lower for k in ["próxima semana", "next week", "la semana que viene", "en unos días", "más adelante", "luego", "later", "en unos dias"]):
+        return 120
+    return 12  # default: 12h
+
+
 def _process_end_of_call(message):
     """
     Process end-of-call-report from Vapi.
@@ -1146,6 +1213,21 @@ def _process_end_of_call(message):
             "press 1 for", "press 2 for", "press 3 for",
             "para español", "for english", "for spanish",
             "dial extension", "enter your", "if you know your party",
+            # Spanish buzón lleno variants not covered above
+            "el buzón está lleno", "el buzon esta lleno",
+            "buzón está lleno", "buzon esta lleno",
+            "no puede dejar un mensaje", "no puede dejar mensaje",
+            "inténtelo más tarde", "intentelo mas tarde",
+            "por favor intente de nuevo",
+            # SMS IVR prompts that follow voicemail messages and break the filter
+            "to send an sms notification", "send an sms notification",
+            "para enviar una notificación por sms", "para enviar una notificacion por sms",
+            "oprima cinco", "oprima 5",
+            # IVR hold/availability check phrases (automated system, not the target patient)
+            "revisaré si esta persona está disponible",
+            "revisare si esta persona esta disponible",
+            "permanez en la línea", "permanez en la linea",
+            "permanece en la línea", "permanece en la linea",
         ]
         user_msgs_content = [
             str(m.get("message", m.get("content", ""))).lower()
@@ -1163,6 +1245,9 @@ def _process_end_of_call(message):
         if user_spoke and not user_spoke_real:
             print(f"[FIX F2] user_spoke overridden to False — all user messages are voicemail phrases")
             user_spoke = False
+
+        # Pre-compute transcript_lower once — used in silence-timed-out branch AND else block
+        transcript_lower = transcript.lower() if transcript else ""
 
         # Calls under 20 seconds are treated as no_contesto regardless of who spoke.
         # Exception: if duration is 0 (startedAt/endedAt missing — common in inbound calls)
@@ -1295,6 +1380,18 @@ def _process_end_of_call(message):
                 outcome = "error_tecnico"
                 outcome_label = "Error Técnico"
                 stage = "Error Técnico"
+            elif any(kw in transcript_lower for kw in LLAMAR_LUEGO_KEYWORDS):
+                outcome = "llamar_luego"
+                outcome_label = "Llamar Luego"
+                stage = "Llamar Luego"
+                if callback_hours_confirmed == 0:
+                    callback_hours_confirmed = _parse_callback_hours(transcript_lower)
+                print(f"[outcome] llamar_luego via keyword in silence-timed-out (hours={callback_hours_confirmed})")
+            elif any(ph in transcript_lower for ph in NO_INTERESADO_PHRASES):
+                outcome = "no_interesado"
+                outcome_label = "No Interesado"
+                stage = "No Interesado"
+                print("[outcome] no_interesado via keyword in silence-timed-out branch")
             else:
                 outcome = "no_agendo"
                 outcome_label = "No Agendó"
@@ -1368,82 +1465,17 @@ def _process_end_of_call(message):
                 stage = "Error Técnico"
                 print("[outcome] error_tecnico — Scenario D: customer-ended-call, user spoke, Elena verifying, no tool calls")
             else:
-                # Check for llamar_luego: client explicitly asked to be called back later
-                # FIX N: Keyword fallback — only used when schedule_callback was NOT detected in messages.
-                # Expanded keyword list to cover natural speech variations.
-                llamar_luego_keywords = [
-                    # Direct requests
-                    "llámame luego", "llama luego", "llámame después", "llama después",
-                    "llámame más tarde", "llama más tarde", "llamar más tarde",
-                    "llámame mañana", "llama mañana",
-                    # Variations with 'me'
-                    "llamarme después", "llamarme más tarde", "llamarme luego",
-                    "me llamas después", "me llamas más tarde", "me llamas luego",
-                    "me llamas mañana", "me puedes llamar", "puedes llamarme",
-                    "me puedes marcar", "puedes marcarme", "me marcas después",
-                    "me marcas más tarde", "me marcas luego", "me marcas mañana",
-                    # Availability expressions
-                    "en otro momento", "ahora no puedo", "ahora mismo no",
-                    "no es buen momento", "no tengo tiempo ahora",
-                    "estoy ocupada", "estoy ocupado",
-                    "ahora estoy ocupada", "ahora estoy ocupado",
-                    "ahorita no puedo", "ahorita no", "ahorita estoy",
-                    "ocupadita", "ocupadito",
-                    "estoy en algo", "estoy en una reunión", "estoy en el trabajo",
-                    "estoy manejando", "estoy conduciendo", "estoy en clase",
-                    "no puedo hablar ahora", "no puedo hablar en este momento",
-                    "este no es buen momento", "no es un buen momento",
-                    # Indirect / soft refusals
-                    "después te llamo", "te marco después", "yo te llamo",
-                    "luego te llamo", "te llamo yo", "te llamo después",
-                    "te llamo más tarde", "te llamo mañana",
-                    "déjame llamarte", "déjame marcarte",
-                    # Future time references
-                    "la semana que viene", "la próxima semana", "llámame la próxima",
-                    "en unos días", "más adelante", "en otro rato",
-                    "pasado mañana", "esta tarde", "esta noche",
-                    # Time-based (client accepted callback offer)
-                    "en 2 horas", "en dos horas", "en 4 horas", "en cuatro horas",
-                    "en 12 horas", "mañana me llamas", "mañana en la mañana", "mañana en la tarde",
-                    # Spanglish / Miami Spanish
-                    "call me later", "call me back", "call me tomorrow",
-                    "llámame back", "llama me back", "call me after",
-                    "i\'m busy", "i am busy", "i can\'t talk", "can\'t talk right now",
-                    "text me", "mándame un text",
-                ]
-                transcript_lower = transcript.lower() if transcript else ""
-                if any(kw in transcript_lower for kw in llamar_luego_keywords):
+                # Keyword fallback (FIX N) — uses module-level LLAMAR_LUEGO_KEYWORDS / NO_INTERESADO_PHRASES
+                # transcript_lower already computed above
+                if any(kw in transcript_lower for kw in LLAMAR_LUEGO_KEYWORDS):
                     outcome = "llamar_luego"
                     outcome_label = "Llamar Luego"
                     stage = "Llamar Luego"
-                    # Parse callback hours from transcript so GHL can route to correct Wait branch
                     if callback_hours_confirmed == 0:
-                        if any(k in transcript_lower for k in ["en 2 hora", "en dos hora", "2 horas", "dos horas", "in 2 hour", "in two hour"]):
-                            callback_hours_confirmed = 2
-                        elif any(k in transcript_lower for k in ["en 4 hora", "en cuatro hora", "4 horas", "cuatro horas", "esta tarde", "this afternoon", "in 4 hour"]):
-                            callback_hours_confirmed = 4
-                        elif any(k in transcript_lower for k in ["mañana", "tomorrow", "tomorrow morning", "mañana en la mañana", "mañana en la tarde"]):
-                            callback_hours_confirmed = 12
-                        elif any(k in transcript_lower for k in ["próxima semana", "next week", "la semana que viene", "en unos días", "más adelante", "luego", "later", "en unos dias"]):
-                            callback_hours_confirmed = 120
-                        else:
-                            callback_hours_confirmed = 12  # default: 12h
+                        callback_hours_confirmed = _parse_callback_hours(transcript_lower)
                     print(f"[outcome] llamar_luego via keyword fallback (hours parsed={callback_hours_confirmed})")
                 else:
-                    # FIX E1: Detect explicit rejection — no_interesado
-                    # Must be checked AFTER llamar_luego to avoid false positives
-                    # ("no puedo ahora" is llamar_luego, not no_interesado)
-                    NO_INTERESADO_PHRASES = [
-                        "no me interesa", "no me interesa el botox", "no me interesa el tratamiento",
-                        "no quiero", "no quiero botox", "no quiero el tratamiento", "no quiero nada",
-                        "no gracias", "no, gracias", "no thank you", "no thanks",
-                        "not interested", "no interest",
-                        "no estoy interesada", "no estoy interesado",
-                        "no me llames más", "no me llames", "no me vuelvas a llamar",
-                        "quítame de tu lista", "remove me from", "don't call me", "do not call me",
-                        "no necesito", "no necesito botox", "no necesito nada",
-                        "no me interesa por ahora", "por ahora no me interesa",
-                    ]
+                    # FIX E1: checked AFTER llamar_luego — "no puedo ahora" is llamar_luego, not no_interesado
                     if any(ph in transcript_lower for ph in NO_INTERESADO_PHRASES):
                         outcome = "no_interesado"
                         outcome_label = "No Interesado"
