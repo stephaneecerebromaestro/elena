@@ -483,7 +483,13 @@ def telegram_notify_call(
     if has_discrepancy:
         level_icon, level_label = "🔴", "DISCREPANCIA DETECTADA"
     elif high_errors:
-        level_icon, level_label = "🟡", "ALERTA DE CALIDAD"
+        level_icon, level_label = "🟠", "ALERTA DE CALIDAD"
+    elif aria_outcome == "agendo":
+        level_icon, level_label = "✅", "AGENDÓ"
+    elif aria_outcome in ("seguimiento_humano", "error_tecnico"):
+        level_icon, level_label = "⚠️", "REQUIERE ATENCIÓN"
+    elif aria_outcome in ("no_contesto", "no_agendo", "no_interesado", "llamar_luego"):
+        level_icon, level_label = "🟡", "SIN AGENDA"
     else:
         level_icon, level_label = "🟢", "LLAMADA OK"
     name_line = (f"👤 <b>{_esc(contact_name)}</b>\n") if contact_name else ""
