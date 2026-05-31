@@ -2396,6 +2396,43 @@ def aria_trigger_audit():
     return jsonify({"ok": True, "status": f"audit triggered for last {hours_back}h"})
 
 
+# ─── Botox Outbound Call — Round-Robin 3 números para distribuir volumen ───────────────────────────
+_BOTOX_PHONE_IDS = [
+    "e8b9ed6d-1b92-44c5-86f2-b818e3f0eb98",  # +17869835076 (original)
+    "712b0fd8-ab9f-4aa2-8bd9-d609c8a31295",  # +17865673389 (Botox 4)
+    "9389d452-07fc-433d-888b-8cdd779ff8e5",  # +17869017849 (Botox 3)
+]
+_BOTOX_ASSISTANT_ID = "1631c7cf-2914-45f9-bf82-6635cdf00aba"
+
+@app.route("/api/botox/trigger-call", methods=["POST"])
+def botox_trigger_call():
+    data = request.json or {}
+    customer_phone = data.get("phone") or data.get("customer_phone") or data.get("number")
+    if not customer_phone:
+        return jsonify({"ok": False, "error": "phone required"}), 400
+
+    import hashlib
+    idx = int(hashlib.md5(customer_phone.encode()).hexdigest(), 16) % len(_BOTOX_PHONE_IDS)
+    phone_id = _BOTOX_PHONE_IDS[idx]
+
+    vapi_key = os.environ.get("VAPI_API_KEY", "")
+    resp = http_requests.post(
+        "https://api.vapi.ai/call/phone",
+        headers={"Authorization": f"Bearer {vapi_key}"},
+        json={
+            "assistantId": _BOTOX_ASSISTANT_ID,
+            "phoneNumberId": phone_id,
+            "customer": {"number": customer_phone},
+        },
+        timeout=30,
+    )
+    return jsonify({
+        "ok": resp.ok,
+        "phone_id_used": phone_id,
+        "call": resp.json() if resp.ok else resp.text,
+    }), resp.status_code
+
+
 # ─── Health Check ──────────────────────────────────────────────────────────────────────────────────
 @app.route("/health", methods=["GET"])
 def health():
