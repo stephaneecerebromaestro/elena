@@ -451,7 +451,7 @@ def handle_check_availability(args):
                 "No hay horarios disponibles en los próximos 14 días. "
                 "Informa al cliente que el calendario está lleno por el momento y "
                 "ofrécele que te deje sus datos para contactarle cuando haya disponibilidad, "
-                "o sugiérele llamar directamente al 786-743-0129."
+                "o sugiérele llamar directamente al 786-953-2577."
             )
         }
 

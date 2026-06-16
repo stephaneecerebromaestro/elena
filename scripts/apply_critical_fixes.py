@@ -10,13 +10,14 @@ Uso:
     python3 scripts/apply_critical_fixes.py --all
     python3 scripts/apply_critical_fixes.py --all --dry-run
 
-Fixes incluidos (v2.3 — 2026-05-16):
+Fixes incluidos (v2.4 — 2026-05-19):
   Fix1: Anti-loop herramientas en silencio/buzón (get_current_time loop)
   Fix2: Bloqueo create_booking si no hubo humano real (ghost booking)
   Fix3: Reconocimiento de recepcionista → esperar 15s
   Fix4: check_availability por DÍA solicitado (no por llamada completa)
   Fix5: Rechazo en inglés → cerrar en inglés (no pre-reserva forzada)
   Fix6: Definiciones mejoradas no_contesto vs no_agendo en analysisPlan
+  Fix7: Regla estricta duración + palabras: <20s o <3 palabras → forzar no_contesto
 """
 
 from __future__ import annotations
@@ -82,7 +83,7 @@ def fix3_receptionist(prompt: str) -> tuple[str, bool]:
         "\"Please stay on the line\", \"Let me check if they're available\", \"Voy a ver si está disponible\", "
         "\"Un momento, se lo comunico\" → NO cuelgues. Espera hasta 15 segundos. Si el cliente real contesta, "
         "continúa con STATE 1. Si no hay respuesta en 15 segundos: "
-        "\"¿Me puede decir que soy Elena de Laser Place y que me llame al 786-743-0129?\" → endCall. "
+        "\"¿Me puede decir que soy Elena de Laser Place y que me llame al 786-953-2577?\" → endCall. "
         "Estas frases son recepcionistas humanos, NO buzones.\n"
     )
     if target in prompt:
@@ -146,6 +147,61 @@ def fix6_outcome_schema(agent: dict) -> tuple[dict, bool]:
         return agent, False
 
 
+def fix7_short_call_classification(agent: dict) -> tuple[dict, bool]:
+    """Regla explícita: llamadas cortas o respuesta de 1 palabra → no_contesto, nunca no_agendo"""
+    keyword = "UNA SOLA PALABRA NO ES CONVERSACION REAL"
+    try:
+        plan = agent['analysisPlan']['structuredDataPlan']
+        props = plan['schema']['properties']
+        msgs = plan['messages']
+
+        # 1 — Actualizar schema description
+        current_desc = props.get('outcome', {}).get('description', '')
+        if keyword not in current_desc:
+            props['outcome']['description'] = (
+                "Resultado final de la llamada. "
+                "no_contesto=USAR SI: (1) buzón de voz/IVR/silencio, "
+                "(2) llamada duró MENOS DE 20 SEGUNDOS aunque el cliente dijera algo, "
+                "(3) cliente respondió con MENOS DE 3 PALABRAS sin formar oración real "
+                "(ejemplos que DEBEN ser no_contesto: 'Ma\\'am', 'Yeah', 'Sí', 'Aló', 'Hello', 'No' + colgó), "
+                "(4) nadie respondió como humano real. "
+                "UNA SOLA PALABRA NO ES CONVERSACION REAL — forzar no_contesto. "
+                "no_agendo=USAR SOLO SI: hubo conversación real (el cliente formó ORACIONES, respondió preguntas, "
+                "dio información, expresó opinión) Y la llamada duró MÁS DE 20 SEGUNDOS Y terminó sin cita. "
+                "agendo=cita creada y confirmada verbalmente. "
+                "llamar_luego=cliente pidió callback explícitamente. "
+                "error_tecnico=error del sistema."
+            )
+            schema_changed = True
+        else:
+            schema_changed = False
+
+        # 2 — Actualizar mensaje del sistema en structuredDataPlan
+        msg_keyword = "REGLA DURACION ESTRICTA"
+        sys_idx = next((i for i, m in enumerate(msgs) if m.get('role') == 'system'), None)
+        if sys_idx is not None and msg_keyword not in msgs[sys_idx].get('content', ''):
+            addition = (
+                "\n\nREGLA DURACION ESTRICTA — OBLIGATORIA:\n"
+                "- Si la llamada duró MENOS DE 20 segundos → outcome DEBE ser no_contesto (sin excepción).\n"
+                "- Si el cliente respondió con 1 o 2 palabras sueltas ('Ma\\'am', 'Yeah', 'Sí', 'Aló', 'Hello') "
+                "y colgó → no_contesto. Una sola palabra NO cuenta como conversación real.\n"
+                "- no_agendo SOLO si el cliente formó oraciones completas y la llamada superó 20 segundos.\n"
+                "EJEMPLOS CONCRETOS:\n"
+                "  Transcript: 'AI: Hola / User: Ma\\'am' + colgó → no_contesto\n"
+                "  Transcript: 'AI: Hola / User: Yeah' + colgó → no_contesto\n"
+                "  Transcript: conversación de 30s donde cliente preguntó sobre el tratamiento → no_agendo"
+            )
+            msgs[sys_idx]['content'] = msgs[sys_idx]['content'] + addition
+            msgs_changed = True
+        else:
+            msgs_changed = False
+
+        changed = schema_changed or msgs_changed
+        return agent, changed
+    except (KeyError, TypeError):
+        return agent, False
+
+
 ALL_PROMPT_FIXES = [fix1_antiloop, fix2_ghost_booking, fix3_receptionist, fix4_checkavail_day, fix5_english_rejection]
 
 
@@ -183,6 +239,10 @@ def apply_to_bot(bot_name: str, api_key: str, dry_run: bool = False) -> bool:
     agent, changed = fix6_outcome_schema(agent)
     if changed:
         applied.append("fix6_outcome_schema")
+
+    agent, changed = fix7_short_call_classification(agent)
+    if changed:
+        applied.append("fix7_short_call_classification")
 
     if not applied:
         print(f"  ⏭️  {bot_name}: todos los fixes ya aplicados")
