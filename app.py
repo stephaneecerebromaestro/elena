@@ -627,6 +627,21 @@ def handle_create_booking(args):
     if not contact_id or not start_time:
         return {"success": False, "message": "Se necesita contactId y startTime para agendar."}
 
+    # 🔒 GATE DE FREEZE (decisión Juan #4 — "no hay sesión sin pago seguro"): si el contacto tiene el tag
+    #    mlp-disputa (chargeback/disputa abierta, proyectado por el puente CRM↔GHL del portal), NO se agenda.
+    #    Determinístico. FAIL-OPEN: ghl_v2_get devuelve {} ante error → sin tags → no bloquea agendas legítimas.
+    try:
+        _c = (ghl_v2_get(f"/contacts/{contact_id}", contacts_version=True) or {}).get("contact", {}) or {}
+        if "mlp-disputa" in (_c.get("tags", []) or []):
+            print(f"[FREEZE] create_booking BLOQUEADO por mlp-disputa: {contact_id}")
+            return {
+                "success": False,
+                "reason": "pago_en_disputa",
+                "message": "Tenemos un tema pendiente con el pago de este paciente. No agendes; pídele que se comunique con soporte para resolverlo antes de agendar.",
+            }
+    except Exception as _fz_err:
+        print(f"[FREEZE] create_booking freeze-check falló (fail-open): {_fz_err}")
+
     # FIX C: Check for duplicate appointments
     existing_appt = handle_get_appointment_by_contact({"contactId": contact_id})
     if existing_appt.get("found"):
@@ -700,6 +715,24 @@ def handle_reschedule_appointment(args):
         return {"success": False, "message": "Se necesita el appointmentId para reagendar."}
     if not new_start_time:
         return {"success": False, "message": "Se necesita el nuevo horario (newStartTime) para reagendar."}
+
+    # 🔒 GATE DE FREEZE (decisión Juan #4): un miembro congelado tampoco puede REAGENDAR (mantener viva su
+    #    sesión). El reschedule solo trae appointmentId → resolvemos el contactId del appointment y leemos su
+    #    tag mlp-disputa. FAIL-OPEN (un blip de GHL no bloquea agendas legítimas).
+    try:
+        _appt = ghl_v2_get(f"/calendars/events/appointments/{appointment_id}") or {}
+        _cid = (_appt.get("appointment", _appt) or {}).get("contactId", "")
+        if _cid:
+            _c = (ghl_v2_get(f"/contacts/{_cid}", contacts_version=True) or {}).get("contact", {}) or {}
+            if "mlp-disputa" in (_c.get("tags", []) or []):
+                print(f"[FREEZE] reschedule BLOQUEADO por mlp-disputa: contacto {_cid} appt {appointment_id}")
+                return {
+                    "success": False,
+                    "reason": "pago_en_disputa",
+                    "message": "Tenemos un tema pendiente con el pago de este paciente. No reagendes; pídele que se comunique con soporte para resolverlo.",
+                }
+    except Exception as _fz_err:
+        print(f"[FREEZE] reschedule freeze-check falló (fail-open): {_fz_err}")
 
     try:
         dt_start = datetime.fromisoformat(new_start_time.replace("Z", "+00:00"))
