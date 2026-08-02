@@ -5,3 +5,7 @@ __pycache__/
 .env
 .venv/
 venv/
+
+# backups locales de la Fase 0 ARIA 2.0 (no versionar: son snapshots grandes)
+prompts_backup_*/
+vapi_assistants_backup_*/

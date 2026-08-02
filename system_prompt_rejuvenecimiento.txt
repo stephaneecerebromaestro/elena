@@ -5,9 +5,9 @@
 # usa scripts/update_prompt.py --bot rejuvenecimiento. Este archivo se regenera
 # con el header actualizado después de cada publicación.
 #
-# Pulled: 2026-06-16
+# Pulled: 2026-08-02
 # Assistant ID: 65b3a4b0-2e08-471f-af56-e091e47f26bd (Rejuvenecimiento)
-# Content SHA (prompt body): 4cfebd155c94c719
+# Content SHA (prompt body): 2ca178c7cc3b8690
 # First message: "Hola, habla Elena de Laser Place. ¿Cómo estás?"
 # ════════════════════════════════════════════════════════════
 
@@ -15,10 +15,10 @@
 
 
 ## ⚡ FECHA ACTUAL (ACTUALIZADO AUTOMÁTICAMENTE)
-**HOY es martes 16 de junio de 2026.** Zona horaria: Miami, Florida (Eastern Time, UTC-4).
-**MAÑANA es miércoles 17 de junio de 2026.**
-- Cuando el cliente diga **"mañana"** → se refiere al **17 de junio de 2026** (miércoles)
-- Cuando el cliente diga **"hoy"** → se refiere al **16 de junio de 2026** (martes)
+**HOY es sábado 1 de agosto de 2026.** Zona horaria: Miami, Florida (Eastern Time, UTC-4).
+**MAÑANA es domingo 2 de agosto de 2026.**
+- Cuando el cliente diga **"mañana"** → se refiere al **2 de agosto de 2026** (domingo)
+- Cuando el cliente diga **"hoy"** → se refiere al **1 de agosto de 2026** (sábado)
 - Cuando el cliente diga **"esta semana"** → los días restantes de esta semana desde hoy
 **USA SIEMPRE estas fechas. NUNCA inventes ni asumas una fecha diferente.**
 
@@ -246,5 +246,4 @@ Esta es la ÚNICA fuente de verdad para el uso de herramientas.
 - Precio: Sesión individual $950. Paquete 3 sesiones $1,800 (regular $2,850, ahorro $1,050). Zonas extra (cuello, escote, manos) precio definido en evaluación
 - Promo abril 2026: 3 sesiones por $1,800
 - Especialista: Laury (12+ años experiencia, 34+ certificaciones)
-- Director clínico: Dr. Gonzalo Mosquera (solo si preguntan)
 - Diferenciador: Candela inventó la tecnología de radiofrecuencia fraccional hace 25+ años. MatrixPro es el equipo más avanzado del mercado con el menor downtime

@@ -8,6 +8,43 @@
 
 ---
 
+## 2026-06-20 ~16:40 UTC — voicemailDetection: Twilio AMD → Vapi (audio-based) en los 7 bots
+
+### Contexto / por qué
+Análisis read-only de 1.000 llamadas auditadas (ARIA): de las correcciones de ARIA, el bloque real de
+error era **55 casos `no_agendo`→`no_contesto`** = Elena le hablaba ~46s a un **buzón** y lo marcaba como
+conversación. Diagnóstico: `voicemailDetection` YA estaba `enabled` con provider **Twilio AMD**, pero NO
+disparaba en esos casos (`original_ended_reason` = "assistant-ended-call", no AMD). Twilio AMD solo evalúa
+al contestar y se pierde buzones personalizados / beep tardío / "mailbox is full". Juan descartó el fix por
+prompt (Elena no lo respeta — doctrina "inteligencia en el sistema, no en el modelo") → fix estructural = B.
+
+### Acción tomada (Vapi API PATCH, autorizado por Juan)
+Cambiado `voicemailDetection.provider` de `twilio` → **`vapi`** (audio-based, evalúa DURANTE la llamada) en
+los **7 assistants de Elena**, con `backoffPlan {startAtSeconds:2, frequencySeconds:2.5, maxRetries:5}` y
+`beepMaxAwaitSeconds:30`. `voicemailMessage` intacto en cada bot (vacío/None → cuelga sin dejar mensaje).
+Vapi marca su propio provider como "recommended" y al de Twilio como "legacy, prone to false positives" →
+el cambio REDUCE falsos positivos.
+
+### Evidencia
+- PATCH HTTP 200 en los 7 + verificación en vivo (GET): los 7 quedaron `provider=vapi`.
+- Assistants: Botox `1631c7cf` · LHR `3d5b77b5` · Acné `77392648` · Cicatrices `b6b09524` ·
+  Fillers `a9494200` · Bioestimuladores `39bd6450` · Rejuvenecimiento `65b3a4b0`.
+
+### Rollback
+Config Twilio previo de los 7 guardado en `rollback_voicemail_20260620.json` (en el home de elena-voice).
+Revertir = PATCH `voicemailDetection` de cada bot al objeto guardado (1 comando por bot).
+
+### Verificación
+- [x] **1 llamada de test (2026-06-20, número interno de Juan, no contestada → buzón).** Resultado: call
+  `019ee5ee-4285-7557-9452-93b087b5147b` terminó a **9.7s** con `endedReason=customer-did-not-answer`
+  (vs ~46s `assistant-ended-call` del problema). El detector Vapi cazó el buzón y cortó rápido. `customer-
+  did-not-answer` mapea a `no_contesto` desde origen. Señal positiva fuerte (1 llamada).
+- [ ] **Medir en ARIA** la caída de `no_agendo`→`no_contesto` durante unos días (prueba definitiva en producción).
+  Revisión agendada: lunes 2026-06-23.
+- Relacionado: `PROMPT_PROPOSALS.md` P-005 (FIX 1).
+
+---
+
 ## 2026-04-14 ~21:55 UTC — Twilio voice_url borrado por configuración WhatsApp
 
 ### Síntoma reportado por Juan
@@ -98,3 +135,14 @@ acción. Stephanee lo marcó como CRITICAL #1 — "ítem inventado en resumen
 ejecutivo". El fix sí ocurrió y hay evidencia verificable (timestamps de
 Twilio API), pero al no producir un commit no había rastro en `git log`.
 **Este archivo (INCIDENTS.md) existe precisamente para resolver ese gap.**
+
+## 2026-08-02 — Fase 0 de ARIA 2.0 (Stephanee)
+**Aplicado a producción (Vapi), verificado con `check_prompt_drift.py` = 7/7 ok:**
+1. **Dr. Gonzalo Mosquera eliminado de los 6 bots** que lo tenían (acné, cicatrices, radiesse, lhr, fillers, rejuvenecimiento). Decisión de Juan 2026-08-02: *"sácalo definitivamente"*.
+2. **Prompt de LHR reconstruido.** Estaba contaminado con contenido de BOTOX (base clínica de Xeomin, objeciones de "quedar congelada", "$10/unidad", "¿quién inyecta?", preguntas sobre arrugas y patas de gallo) más 4 corrupciones de texto de un search/replace roto ("¿Te agendo una esta semana?isis facial…", "sin compromiso.ormalmente vale…", "The free evaled.", "el evaluación"). Reescrito con la base real de depilación láser (GentleYAG PRO, folículo, 97%, sesiones cada 4 semanas, SOP, vellos encarnados) tomada de la fuente de verdad `elena-chat/prompts/lhr_offer.txt`. Unificada la experiencia de Laury a "más de doce años" (había 13 y doce en el mismo archivo).
+   - SHA nuevo LHR: `12523ba33c290e03` · backup de los 7 prompts en `prompts_backup_20260802_000421/`
+
+**Verificado y NO cambiado:**
+3. **`schedule_callback` se queda en los 7 bots.** Medido antes de tocar: se usa en 9/25 llamadas `llamar_luego` (36%) y NO se invoca en buzones (30/30 limpias) — la causa del bucle exponencial de abril 2026 ya está mitigada por el gate anti-buzón. Eliminarla rompería el callback sin ganar seguridad. Pendiente: declararla en los guiones (hoy el modelo la invoca solo por su descripción interna). Backup de los 7 assistants: `vapi_assistants_backup_20260802_001007/`
+
+**Hallazgo nuevo (no había sido reportado):** 92 teléfonos recibieron 7+ llamadas en 90 días; el peor, **18 llamadas sin contestar ni una vez**. Riesgo TCPA y de marca. Escalado a Juan.

@@ -27,6 +27,7 @@
 | P-002 | Desync entre `system_prompt.txt` del repo y prompt live en Vapi | `applied` 2026-04-14 | Botox | 2026-04-14 |
 | P-003 | Loops de `check_availability` persisten pese a FIX D | `observing` | LHR | 2026-04-14 |
 | P-004 | STATE 5 de LHR tiene texto corrupto ("oral Gables", duplicado "por mensaje") | `applied` 2026-04-14 | LHR | 2026-04-14 |
+| P-005 | Clasificación no-contestadas en ORIGEN — 5 fixes (buzón, vacío, silencio/IVR, rechazo rápido, umbral) | FIX 1 `applied` 2026-06-20 (7 bots, pend. verif.) · fixes 2-5 `proposed` | Todos | 2026-06-20 |
 
 **Estados:** `proposed` → `approved` → `applied` → `verified` · o `rejected` · o `observing` (pre-propuesta, recolectando más data)
 
@@ -246,6 +247,59 @@ Efecto: la próxima corrida del cron semanal (lunes 20) tendrá cobertura ARIA >
 | 2026-04-14 | P-004 aplicado: texto corrupto de LHR normalizado a la misma despedida limpia de Botox. SMS LHR verificado con 4 bookings. SHA `15875198debb0f9d`. Mirror en `system_prompt_lhr.txt`. |
 | 2026-04-14 | O-002 cerrado (Juan): workflow GHL ya manda WhatsApp de bienvenida desde el mismo número Twilio antes de la llamada. Verificar contact_rate en corridas post-lunes 20. |
 | 2026-04-14 | O-003 asumido por Juan: cambia slots de 5→30 min en GHL cuando tenga tiempo. |
+
+---
+
+## P-005 — Clasificación de no-contestadas en ORIGEN (5 fixes)
+
+**Estado:** `proposed` 2026-06-20 · **Bot:** Todos · **Prioridad:** ALTA (#1) / MEDIA (resto) · **Riesgo:** ver cada fix
+**Propone:** Stephanee · **Aprobador:** Juan (uno por uno) · **Principio:** atacar el error en ORIGEN (Vapi/GPT-4o-mini al momento de la llamada); **NO se toca a ARIA** (el corrector LLM se queda intacto — Juan no confía en una versión sin LLM).
+
+### Evidencia (datos reales, 1.000 últimas llamadas auditadas · consulta read-only 2026-06-20)
+- ARIA corrigió **321/1.000 (32%)**. Desglose de las correcciones:
+  - **217** `(vacío)` → `no_contesto` (68% de las correcciones) — Vapi no dejó outcome; ARIA rellena.
+  - **55** `no_agendo` → `no_contesto` — **el error real:** Elena creyó conversación, era **buzón**.
+  - 9 `no_contesto`→`llamar_luego` · 9 `no_contesto`→`no_interesado` · 2 `no_agendo`→`agendo` (cita perdida recuperada).
+- Análisis quirúrgico de los casos `no_agendo`→`no_contesto` (muestra 100): **duración mediana 46s** (solo 4/100 <20s → el umbral "<20s" NO los caza); `silence_detected` solo **24/100**; `ended_reason` 54 "assistant-ended-call". Transcripts inequívocos: *"Por favor, deje su mensaje para 786…"*, *"Please leave your message for…"*, *"Mailbox is full"*, *"At the tone, please record your message"*, *"déjeme tu nombre y tu teléfono"*. → **Elena le habla ~46s a un buzón** antes de colgar.
+
+### Los 5 fixes (cada uno requiere OK explícito de Juan antes de aplicar)
+
+**FIX 1 — Detección de buzón → provider Vapi audio-based (ALTA, la palanca real). ✅ APLICADO 2026-06-20.**
+- Hallazgo: `voicemailDetection` YA estaba enabled con **Twilio AMD**, pero NO disparaba en los 55 casos
+  (AMD solo evalúa al contestar; se pierde buzones personalizados/beep tardío). Juan descartó el fix por
+  prompt (Elena no lo respeta). → Fix estructural: cambiar provider a **`vapi`** (audio-based, evalúa durante
+  la llamada). Vapi marca su provider "recommended" y a Twilio "legacy, prone to false positives".
+- **Aplicado a los 7 bots de Elena** (PATCH Vapi, HTTP 200 + verificado `provider=vapi` en vivo).
+  `voicemailMessage` intacto (cuelga sin dejar mensaje). Rollback: `rollback_voicemail_20260620.json`. Ver INCIDENTS.md.
+- Doble payoff: clasificación correcta (`no_contesto`) **+ ahorro real** (~46s × cientos de buzones).
+- **Verificación:** ✅ 1 llamada de test (2026-06-20, buzón) terminó a **9.7s** / `customer-did-not-answer`
+  (vs ~46s antes) — detector cazó el buzón. ⏳ Pendiente: medir caída `no_agendo`→`no_contesto` en ARIA unos días (lunes 23).
+
+**FIX 2 — Outcome vacío → `no_contesto` por defecto en ORIGEN (MEDIA).**
+- Qué: que el end-of-call de Vapi/app.py emita `no_contesto` cuando no hay transcript/conexión, en vez de dejarlo vacío (hoy ARIA lo rellena, pero depende de ARIA).
+- Capa: **app.py / análisis Vapi**. Riesgo: MUY BAJO. Nota: ARIA ya cubre esto, así que es robustez/consistencia, no urgencia.
+
+**FIX 3 — Silencio / IVR / sin voz real → `no_contesto` (MEDIA).**
+- Qué: bajar el umbral de silencio (hoy caza solo 24% de los buzones) + detectar frases de IVR ("permanece en la línea", "marque", "press 1").
+- Capa: **config Vapi (silence) + prompt/análisis (IVR)**. Riesgo: BAJO.
+
+**FIX 4 — Rechazo rápido → `no_interesado` (MEDIA).**
+- Qué: Elena/Vapi no caza los "no me interesa" cortos (histórico Vapi 2 vs ARIA 15; aquí 9 `no_contesto`→`no_interesado`). Reforzar reconocimiento de rechazo explícito.
+- Capa: **prompt/análisis**. Riesgo: BAJO.
+
+**FIX 5 — Redefinir "conversación real" (MEDIA).**
+- Qué: el límite actual separa mal `no_agendo` real de `no_contesto` (un buzón de 46s pasa como "conversación"). Requerir intercambio bidireccional real del paciente, no solo duración.
+- Capa: **prompt + lógica de outcome**. Riesgo: MEDIO (afina la frontera; medir antes/después con ARIA).
+
+### Recomendación de Stephanee
+Empezar SOLO por **FIX 1** (mayor impacto + menor riesgo + medible de inmediato con ARIA): activar `voicemailDetection` en un assistant (ej. Botox), 1 llamada de test interna, verificar que cuelga en buzón, y medir la caída de `no_agendo`→`no_contesto` en ARIA durante unos días antes de extender a los demás. Los fixes 2-5 después, uno por uno, midiendo cada uno.
+
+### Checklist antes de aplicar (por fix)
+- [ ] Juan aprueba el fix específico
+- [ ] Cambio con `--dry-run` primero (regla HARD de elena-voice)
+- [ ] 1 llamada de test a número interno (NO paciente real)
+- [ ] Verificar transcript + outcome del test
+- [ ] Medir efecto en ARIA (matriz de correcciones) durante N días antes de extender
 
 ---
 

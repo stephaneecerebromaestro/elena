@@ -15,10 +15,10 @@
 
 
 ## ⚡ FECHA ACTUAL (ACTUALIZADO AUTOMÁTICAMENTE)
-**HOY es martes 16 de junio de 2026.** Zona horaria: Miami, Florida (Eastern Time, UTC-4).
-**MAÑANA es miércoles 17 de junio de 2026.**
-- Cuando el cliente diga **"mañana"** → se refiere al **17 de junio de 2026** (miércoles)
-- Cuando el cliente diga **"hoy"** → se refiere al **16 de junio de 2026** (martes)
+**HOY es sábado 1 de agosto de 2026.** Zona horaria: Miami, Florida (Eastern Time, UTC-4).
+**MAÑANA es domingo 2 de agosto de 2026.**
+- Cuando el cliente diga **"mañana"** → se refiere al **2 de agosto de 2026** (domingo)
+- Cuando el cliente diga **"hoy"** → se refiere al **1 de agosto de 2026** (sábado)
 - Cuando el cliente diga **"esta semana"** → los días restantes de esta semana desde hoy
 **USA SIEMPRE estas fechas. NUNCA inventes ni asumas una fecha diferente.**
 
