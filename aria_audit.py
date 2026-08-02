@@ -29,6 +29,7 @@ CAMBIOS v3.0:
 import os
 import json
 import logging
+import re
 import requests
 import smtplib
 import threading as _threading
@@ -812,6 +813,63 @@ def audit_call_with_claude(call_data: dict, treatment_display: str = "Botox") ->
 
 
 # ============================================================
+# DETECTOR DETERMINÍSTICO DE BUZÓN (ARIA 2.0 · 2026-08-02)
+# ============================================================
+# POR QUÉ: el 90% del volumen son buzones de voz. Hoy cada uno paga un análisis
+# de Haiku (~$0.005) para concluir lo obvio, y encima el LLM se EQUIVOCA en ellos:
+# medido sobre 90 días, 36 de 214 "llamar_luego" eran en realidad contestadores
+# ("Hola, soy Olive. En estos momentos no puedo contestar. Deje su mensaje…"
+#  → ARIA lo clasificó como lead recuperable). Ese error ensucia el CRM y las métricas.
+#
+# CALIBRACIÓN (medida sobre 4.874 llamadas auditadas con LLM, 2026-08-02):
+#   · Filtro por LONGITUD (dur<20s & transcript<400) → capturaba 71% pero MATABA
+#     98 llamadas reales, 81 de ellas "llamar_luego". DESCARTADO: habría destruido
+#     la señal más valiosa del sistema para ahorrar costo.
+#   · Filtro por PATRÓN INEQUÍVOCO (esta implementación) → captura ~43% del gasto
+#     y ADEMÁS corrige clasificaciones que el LLM tenía mal.
+#
+# REGLA DE SELECCIÓN DE FRASES: solo entran aquí las que una MÁQUINA dice y una
+# persona NO. Deliberadamente EXCLUIDAS las ambiguas que sí dice un humano ocupado
+# ("te llamo más tarde", "en este momento no puedo atenderte", "no puedo atenderte"),
+# porque ésas son leads recuperables reales — perderlas cuesta dinero.
+_BUZON_MAQUINA = re.compile(
+    r"deje su mensaje|deja tu mensaje|d[eé]jame tu mensaje|leave a message|leave me a message|"
+    r"at the tone|please record your message|when you have finished recording|you may hang up|"
+    r"mailbox|buz[oó]n est[aá] lleno|no acepta mensajes|cannot accept any messages|"
+    r"graba tu mensaje|favor de grabar|despu[eé]s de la se[nñ]al|secretaria electr[oó]nica|"
+    r"oprima \w+|press \d|para espa[nñ]ol|notificaci[oó]n por sms|has not been set up|"
+    r"hasn'?t been set up",
+    re.I,
+)
+
+
+def es_buzon_inequivoco(call_data: dict) -> bool:
+    """True si lo que respondió el OTRO LADO es inequívocamente una máquina.
+
+    Solo mira las líneas 'User:' — lo que dice Elena no cuenta (ella habla primero
+    en outbound y su saludo no es señal de nada). Determinístico: sin LLM, sin costo.
+    """
+    transcript = call_data.get("transcript", "") or ""
+    if not transcript:
+        return False
+    lado_cliente = " ".join(
+        ln[5:] for ln in transcript.split("\n") if ln.startswith("User:")
+    )
+    return bool(_BUZON_MAQUINA.search(lado_cliente))
+
+
+def sin_conversacion_real(call_data: dict) -> bool:
+    """Gate de pre-filtro: ¿esta llamada merece gastar un análisis de Claude?
+
+    Dos casos, ambos verificados contra 4.874 llamadas reales:
+      1. transcript casi vacío (<50 chars) — el criterio que ya existía.
+      2. buzón inequívoco por patrón — nuevo, y más preciso que el LLM.
+    """
+    transcript = call_data.get("transcript", "") or ""
+    return len(transcript) < 50 or es_buzon_inequivoco(call_data)
+
+
+# ============================================================
 # REGISTRO DE NO_CONTESTO AUTOMÁTICO (sin gastar Claude)
 # ============================================================
 
@@ -1304,7 +1362,7 @@ def _build_report_from_vapi(utc_start: str, utc_end: str, label: str, chat_id: s
         if call_id in audited_ids:
             continue
         transcript = call.get("transcript", "") or ""
-        if len(transcript) < 50:
+        if sin_conversacion_real(call):
             saved = register_no_contesto(call)
             if saved:
                 auto_classified += 1
@@ -1577,7 +1635,7 @@ def _run_audit_range(utc_start: str, utc_end: str, label: str) -> dict:
             skipped_already += 1
             continue
         transcript = call.get("transcript", "") or ""
-        if len(transcript) < 50:
+        if sin_conversacion_real(call):
             saved = register_no_contesto(call)
             if saved:
                 auto_classified += 1
@@ -2788,7 +2846,7 @@ def _aria_polling_loop(interval_seconds: int = 180):
             for call_data in pending:
                 call_id = call_data.get("id", "?")
                 transcript = call_data.get("transcript", "") or ""
-                if len(transcript) < 50:
+                if sin_conversacion_real(call_data):
                     # FIX B: registrar como no_contesto, verificar que guardó
                     try:
                         saved = register_no_contesto(call_data)
