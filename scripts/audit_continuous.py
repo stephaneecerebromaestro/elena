@@ -132,10 +132,23 @@ def fetch_vapi_calls(assistant_id: str, utc_start: str, utc_end: str,
 def fetch_audits(utc_start: str, utc_end: str) -> dict[str, dict]:
     """Trae auditorías ARIA del rango. Devuelve dict {vapi_call_id: audit_row}."""
     try:
-        records = supabase_query(
-            "call_audits",
-            f"call_started_at=gte.{utc_start}&call_started_at=lt.{utc_end}&limit=2000",
-        )
+        # ARIA 2.0 · LECCIÓN V1 #3 (2026-08-03): PostgREST devuelve MÁXIMO 1.000 filas
+        # aunque se pidan 2.000 — y sin `order` la muestra es arbitraria. El reporte
+        # semanal estaba calculando sobre un subconjunto silencioso. Ahora pagina.
+        records = []
+        _off, _page = 0, 1000
+        while True:
+            _lote = supabase_query(
+                "call_audits",
+                f"call_started_at=gte.{utc_start}&call_started_at=lt.{utc_end}"
+                f"&order=call_started_at.asc&limit={_page}&offset={_off}",
+            )
+            if not _lote:
+                break
+            records.extend(_lote)
+            _off += len(_lote)
+            if len(_lote) < _page or _off > 20000:
+                break
     except Exception as e:
         log.error(f"Supabase audits query exception: {e}")
         return {}
@@ -226,7 +239,12 @@ def compute_stats(calls: list[dict], audits: dict[str, dict]) -> dict[str, Any]:
 
             # Razones de no_agendo (resumen ARIA, primeras 140 chars)
             if outcome == "no_agendo":
-                summary = (audit.get("aria_summary") or "").strip()
+                # ARIA 2.0 · A6 FIX (2026-08-03): la columna se llama `aria_reasoning`,
+                # NO `aria_summary` (verificado contra el esquema real de call_audits).
+                # Por ese nombre equivocado, la sección "Top 3 razones de no_agendo" del
+                # reporte semanal salía VACÍA todas las semanas — y la propia metodología
+                # del reporte lo documentaba como si fuera normal.
+                summary = (audit.get("aria_reasoning") or audit.get("aria_summary") or "").strip()
                 if summary:
                     no_agendo_reasons[summary[:140]] += 1
 
@@ -424,7 +442,7 @@ def format_markdown(results: list[dict], utc_cur: tuple[str, str],
         "- **Fuente de verdad para totales:** Vapi API (status = `ended`)",
         "- **Clasificación de outcome:** `call_audits.aria_outcome` en Supabase; "
         "llamadas con transcript <50 chars se marcan como `no_contesto` sin necesidad de auditoría",
-        "- **Top razones no_agendo:** `aria_summary` de auditorías con outcome `no_agendo`",
+        "- **Top razones no_agendo:** `aria_reasoning` de auditorías con outcome `no_agendo`",
         "- **Loops check_availability:** llamadas con ≥3 invocaciones de la tool en `artifact.messages`",
         "- **Umbral de alerta:** caída relativa ≥20% en conversión vs semana anterior "
         "(requiere ≥5 llamadas contestadas para evitar falsos positivos en volumen bajo)",

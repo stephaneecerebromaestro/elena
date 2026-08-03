@@ -632,16 +632,11 @@ Tu trabajo es analizar transcripts de llamadas telefónicas y determinar:
 - **missed_objection**: El cliente expresó una objeción que Elena no manejó
 - **unnecessary_tool_call**: Elena llamó a una herramienta innecesariamente
 
-## PLAYBOOK DE ELENA (resumen):
-1. Saludo → confirmar que hay persona real → preguntar si tiene 2 minutos
-2. Preguntar qué le llama la atención del tratamiento (descubrir necesidad)
-3. Proponer evaluación gratuita (Skin Reveal Analysis)
-4. Preguntar si los martes funcionan (día preferido de la clínica)
-5. Si no → ofrecer otros días disponibles
-6. check_availability → presentar 2 opciones máximo
-7. Cuando el cliente elige y confirma → create_booking
-8. Si el cliente pregunta precio → explicar que se personaliza, invitar a la evaluación gratuita
-9. Despedida con confirmación de la cita
+## PLAYBOOK DE ELENA — el guion REAL que este bot tiene HOY:
+IMPORTANTE: juzga la adherencia SOLO contra este guion. NO penalices a Elena por
+no hacer cosas que este guion no le pide. Si el guion no menciona un paso, ese
+paso NO existe para esta llamada.
+{playbook_vivo}
 
 ## INTELIGENCIA DE CLIENTE:
 Solo para llamadas con conversación real (transcript >200 chars y no es buzón).
@@ -769,11 +764,76 @@ def _get_treatment_from_call(call_data: dict) -> tuple[str, str]:
     return treatment_key, _TREATMENT_DISPLAY.get(treatment_key, treatment_key.title())
 
 
-def _build_aria_system_prompt(treatment_display: str) -> str:
-    return _ARIA_SYSTEM_PROMPT_TEMPLATE.replace("{treatment_name}", treatment_display)
+# ── ARIA 2.0 · A8 (2026-08-03): LA VARA VIVA ────────────────────────────────
+# LECCIÓN V1 #9 — cero copias manuales de algo que vive en otro lado.
+# v1 puntuaba la adherencia contra un resumen ESCRITO A MANO que no cambió desde
+# el commit fundacional del 2026-03-28. Los guiones de Elena cambiaron 6 veces:
+#   · "preguntar si tiene 2 minutos" se ELIMINÓ a propósito el 2026-05-30
+#   · "Skin Reveal Analysis" solo lo usa Botox; 6 bots dicen otra cosa
+#   · el "martes primero" se quitó de 4 de los 7 bots
+# Resultado: ARIA penalizaba a Elena por OBEDECER su propio guion, y el
+# playbook_adherence_score (media 0.66) era en buena parte artefacto de la vara.
+# Ahora la vara se lee del guion VIVO del bot auditado. Los mirrors están
+# garantizados idénticos a Vapi por check_prompt_drift (cron semanal + manual).
+_PLAYBOOK_CACHE: dict = {}
+_PLAYBOOK_FALLBACK = """(no se pudo leer el guion vivo — juzga solo lo evidente:
+si hubo conversación real, si se ofreció la cita y si se manejó la objeción.
+NO penalices pasos concretos que no puedas verificar contra el guion.)"""
+
+_MIRROR_POR_TRATAMIENTO = {
+    "botox": "system_prompt.txt",
+    "lhr": "system_prompt_lhr.txt",
+    "acne": "system_prompt_acne.txt",
+    "cicatrices": "system_prompt_cicatrices.txt",
+    "fillers": "system_prompt_fillers.txt",
+    "radiesse": "system_prompt_radiesse.txt",
+    "rejuvenecimiento": "system_prompt_rejuvenecimiento.txt",
+}
 
 
-def audit_call_with_claude(call_data: dict, treatment_display: str = "Botox") -> dict:
+def _playbook_vivo(treatment_key: str) -> str:
+    """Extrae la máquina de estados REAL del guion del bot (BLOQUE 2).
+
+    Solo el BLOQUE 2 (~3.500 chars ≈ 1.000 tokens), no el guion entero (~25.000
+    chars): el prompt del juez debe seguir siendo barato. Cachea por tratamiento.
+    Fail-safe: si algo falla, devuelve una instrucción conservadora en vez de
+    romper la auditoría (v1 ya tuvo un caso donde el prompt reventaba en silencio).
+    """
+    if treatment_key in _PLAYBOOK_CACHE:
+        return _PLAYBOOK_CACHE[treatment_key]
+    try:
+        nombre = _MIRROR_POR_TRATAMIENTO.get(treatment_key)
+        if not nombre:
+            return _PLAYBOOK_FALLBACK
+        ruta = os.path.join(os.path.dirname(os.path.abspath(__file__)), nombre)
+        texto = open(ruta, encoding="utf-8", errors="replace").read()
+        ini = texto.find("=== BLOQUE 2")
+        if ini == -1:
+            log.warning(f"playbook vivo [{treatment_key}]: no encontré el BLOQUE 2")
+            return _PLAYBOOK_FALLBACK
+        fin = texto.find("=== BLOQUE 3", ini)
+        bloque = (texto[ini:fin] if fin != -1 else texto[ini:ini + 6000]).strip()
+        if len(bloque) < 200:
+            return _PLAYBOOK_FALLBACK
+        _PLAYBOOK_CACHE[treatment_key] = bloque
+        log.info(f"playbook vivo [{treatment_key}]: {len(bloque)} chars cargados")
+        return bloque
+    except Exception as e:
+        log.error(f"playbook vivo [{treatment_key}] falló: {e}")
+        return _PLAYBOOK_FALLBACK
+
+
+def _build_aria_system_prompt(treatment_display: str, treatment_key: str = "botox") -> str:
+    # OJO: .replace() y NO .format() — las llaves {} del bloque JSON del formato de
+    # respuesta rompen .format(). Ese bug real (2026-04-29) dejó la auditoría
+    # fallando EN SILENCIO en producción hasta que se cambió a .replace().
+    return (_ARIA_SYSTEM_PROMPT_TEMPLATE
+            .replace("{treatment_name}", treatment_display)
+            .replace("{playbook_vivo}", _playbook_vivo(treatment_key)))
+
+
+def audit_call_with_claude(call_data: dict, treatment_display: str = "Botox",
+                           treatment_key: str = "botox") -> dict:
     """Auditar una llamada con Claude. Produce outcome + errores + inteligencia de cliente."""
     call_id = call_data.get("id", "unknown")
     transcript = call_data.get("transcript", "") or ""
@@ -824,7 +884,7 @@ def audit_call_with_claude(call_data: dict, treatment_display: str = "Botox") ->
         response = anthropic_client.messages.create(
             model=AUDIT_MODEL,
             max_tokens=1500,
-            system=_build_aria_system_prompt(treatment_display),
+            system=_build_aria_system_prompt(treatment_display, treatment_key),
             messages=[{"role": "user", "content": user_prompt}]
         )
         response_text = response.content[0].text.strip()
@@ -1140,7 +1200,8 @@ def _process_call_inner(call_data: dict, already_audited: set, call_id: str, sil
                     break
 
     # Auditar con Claude PRIMERO (tarda ~30s), luego leer GHL para evitar race condition
-    audit_result = audit_call_with_claude(call_data, treatment_display=treatment_display)
+    audit_result = audit_call_with_claude(call_data, treatment_display=treatment_display,
+                                          treatment_key=treatment_key)
     aria_outcome = audit_result.get("correct_outcome")
     aria_confidence = audit_result.get("confidence", 0.0)
 
@@ -2913,7 +2974,8 @@ def run_audit(hours_back: int = None, dry_run: bool = False):
     for i, call in enumerate(new_calls):
         log.info("Auditing call " + str(i + 1) + "/" + str(len(new_calls)) + ": " + str(call.get("id")))
         if dry_run:
-            audit_result = audit_call_with_claude(call)
+            _tk, _td = _get_treatment_from_call(call)
+            audit_result = audit_call_with_claude(call, treatment_display=_td, treatment_key=_tk)
             result = {
                 "call_id": call.get("id"),
                 "original_outcome": None,
@@ -3312,7 +3374,8 @@ if __name__ == "__main__":
         calls = fetch_vapi_calls(hours_back=72, limit=50)
         calls = [c for c in calls if len(c.get("transcript", "") or "") > 200][:n]
         for call in calls:
-            result = audit_call_with_claude(call)
+            _tk, _td = _get_treatment_from_call(call)
+            result = audit_call_with_claude(call, treatment_display=_td, treatment_key=_tk)
             print("\nCall: " + call.get("id"))
             print("ARIA: " + str(result.get("correct_outcome")) + " (" + str(round(result.get("confidence", 0) * 100)) + "%)")
             print("Errors: " + str(len(result.get("errors_detected", []))))
