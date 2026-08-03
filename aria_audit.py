@@ -303,6 +303,39 @@ def fetch_vapi_calls_range(utc_start: str, utc_end: str, limit: int = 500,
     return r.json()
 
 
+def fetch_vapi_calls_range_todos(utc_start: str, utc_end: str, limit: int = 500) -> list:
+    """Llamadas de TODOS los bots en un rango. ARIA 2.0 · A4 (2026-08-03).
+
+    LECCIÓN V1 #7 — un default silencioso es una mentira que escala:
+    `fetch_vapi_calls_range()` cae a VAPI_ASSISTANT_ID (= Botox) cuando no se le
+    pasa un bot. TODOS los reportes heredaron ese default, así que Juan leía ~24
+    llamadas/semana de Botox creyendo que veía las 343 de los 7 bots. La cobertura
+    daba >100% (comparaba Botox contra el total de Supabase) y nadie lo cuestionó.
+    Esta función recorre `config.ASSISTANTS` y devuelve la unión, etiquetando cada
+    llamada con su tratamiento para poder segmentar.
+    """
+    try:
+        from config import ASSISTANTS as _AS
+    except Exception as e:
+        log.error(f"no pude cargar config.ASSISTANTS ({e}) — reporte de UN bot, NO del total")
+        return fetch_vapi_calls_range(utc_start, utc_end, limit=limit)
+    todas, vistos = [], set()
+    for aid, cfg in _AS.items():
+        trat = cfg.get("treatment", "?") if isinstance(cfg, dict) else str(cfg)
+        try:
+            for c in fetch_vapi_calls_range(utc_start, utc_end, limit=limit, assistant_id=aid):
+                cid = c.get("id")
+                if cid in vistos:
+                    continue
+                vistos.add(cid)
+                c["_treatment"] = trat          # etiqueta para segmentar el reporte
+                todas.append(c)
+        except Exception as e:
+            log.error(f"Vapi range fetch falló para {trat}: {e}")
+    log.info(f"fetch_vapi_calls_range_todos: {len(todas)} llamadas de {len(_AS)} bots")
+    return todas
+
+
 def fetch_vapi_call_by_id(call_id: str) -> Optional[dict]:
     _vapi_key = os.environ.get("VAPI_API_KEY") or VAPI_API_KEY
     r = requests.get(
@@ -813,6 +846,126 @@ def audit_call_with_claude(call_data: dict, treatment_display: str = "Botox") ->
 
 
 # ============================================================
+# SANEADO DE ERRORES DEL LLM (ARIA 2.0 · A2 · 2026-08-03)
+# ============================================================
+# LECCIÓN V1 #5 y #6. Dos problemas medidos sobre 4.000 auditorías:
+#   1. El LLM ignora las excepciones de su propio prompt: `premature_greeting`
+#      1.767 casos (95% en llamadas sin respuesta) y `premature_endcall` 462 (69%),
+#      cuando el prompt dice explícitamente que NO se marquen en esos casos.
+#      Juntos = ~70% de TODOS los errores reportados. Puro ruido en el tablero de Juan.
+#   2. Sin whitelist, el modelo inventó tipos que no existen en el manual
+#      (`missed_callback_execution`, `premature_pitch`).
+# Nada de esto se arregla pidiéndoselo mejor al prompt: son condiciones duras → van en código.
+
+# Los 10 tipos que el prompt define. Lo que no esté aquí no entra a la tabla como válido.
+_TIPOS_ERROR_VALIDOS = {
+    "missed_close", "wrong_info", "playbook_violation", "premature_endcall",
+    "repeated_availability_check", "language_switch", "confusion_created",
+    "premature_greeting", "missed_objection", "unnecessary_tool_call",
+}
+
+# Reglas del propio prompt de ARIA, ahora aplicadas de verdad:
+#   · premature_greeting: en llamadas SALIENTES Elena habla primero — es lo correcto.
+#     No puede saber que es un buzón hasta que el buzón responde.
+#   · premature_endcall: si nadie contestó, colgar es lo correcto.
+_ERRORES_NO_APLICAN_SIN_RESPUESTA = {"premature_greeting", "premature_endcall"}
+
+
+def _sanear_errores(errores: list, aria_outcome: str, call_type: str = "") -> tuple:
+    """Devuelve (errores_válidos, motivos_de_descarte).
+
+    Descarta lo que contradice las propias reglas del prompt y lo que está fuera
+    de taxonomía. Nada se pierde en silencio: lo descartado se registra en
+    `raw_vapi_data.errores_descartados` para poder auditarlo después.
+    """
+    validos, descartados = [], []
+    sin_respuesta = (aria_outcome == "no_contesto")
+    es_saliente = (call_type == "outboundPhoneCall")
+    for e in (errores or []):
+        if not isinstance(e, dict):
+            descartados.append("formato_invalido"); continue
+        tipo = (e.get("type") or "").strip()
+        if tipo not in _TIPOS_ERROR_VALIDOS:
+            descartados.append(f"{tipo or '?'}:fuera_de_taxonomia"); continue
+        if sin_respuesta and tipo in _ERRORES_NO_APLICAN_SIN_RESPUESTA:
+            descartados.append(f"{tipo}:no_aplica_sin_respuesta"); continue
+        if tipo == "premature_greeting" and es_saliente:
+            descartados.append(f"{tipo}:saliente_habla_primero"); continue
+        validos.append(e)
+    return validos, descartados
+
+
+# ============================================================
+# ALARMA DE ESCRITURA MUERTA (ARIA 2.0 · 2026-08-03)
+# ============================================================
+# LECCIÓN V1 #1 — el anti-patrón madre: las 5 averías silenciosas de v1 compartían
+# el MISMO modo de falla (el error se loguea y el llamador ignora el None).
+# `call_intelligence` y `daily_metrics` estuvieron 4 MESES sin escribir y nadie
+# se enteró, porque el reporte de Telegram sí se enviaba.
+# Esto convierte ese silencio en una alarma: N fallos consecutivos de escritura
+# en la misma tabla → Telegram. Con dedup por tabla+día para no volverse ruido
+# (la otra lección de la casa: un canario que repite lo sabido entrena a ignorarlo).
+_FALLOS_ESCRITURA: dict = {}
+_FALLOS_ALERTADOS: dict = {}
+_UMBRAL_FALLOS_ESCRITURA = 3
+
+# LECCIÓN V1 #2 — la forma del dato se verifica contra el esquema REAL.
+# `daily_metrics` llevaba 4 MESES sin escribir porque el código emitía
+# `unique_contacts`, una columna que NO EXISTE: Postgres rechazaba la fila entera
+# (PGRST204) todos los días y el error moría en un log que nadie leía.
+# Columnas verificadas contra el OpenAPI de PostgREST el 2026-08-03.
+# Filtrar el payload hace que este bug —y cualquier campo futuro que no exista—
+# sea IMPOSIBLE: se descarta el campo sobrante, no la fila completa.
+_COLS_DAILY_METRICS = {
+    "metric_date", "agent_name", "total_calls", "calls_agendo", "calls_no_agendo",
+    "calls_no_contesto", "calls_llamar_luego", "calls_error_tecnico",
+    "calls_no_interesado", "calls_with_errors", "calls_with_silence",
+    "conversion_rate", "contact_rate", "avg_call_duration_seconds",
+    "avg_playbook_adherence", "aria_discrepancies_found", "aria_corrections_applied",
+    "aria_corrections_approved", "aria_corrections_rejected", "top_errors",
+    "report_generated_at", "report_sent_email", "report_sent_whatsapp",
+}
+
+
+def _payload_daily_metrics(metrics: dict) -> dict:
+    """Deja pasar solo columnas que existen en la tabla; avisa de las descartadas."""
+    limpio = {k: v for k, v in metrics.items() if k in _COLS_DAILY_METRICS}
+    sobrantes = set(metrics) - set(limpio)
+    if sobrantes:
+        log.info(f"daily_metrics: campos no persistidos (no son columnas): {sorted(sobrantes)}")
+    return limpio
+
+
+def _alerta_escritura_muerta(tabla: str, ref: str = "") -> None:
+    """Cuenta fallos de escritura por tabla y alerta al cruzar el umbral (1 vez/día)."""
+    try:
+        hoy = datetime.now().strftime("%Y-%m-%d")
+        n = _FALLOS_ESCRITURA.get(tabla, 0) + 1
+        _FALLOS_ESCRITURA[tabla] = n
+        if n < _UMBRAL_FALLOS_ESCRITURA:
+            return
+        if _FALLOS_ALERTADOS.get(tabla) == hoy:     # ya avisado hoy
+            return
+        _FALLOS_ALERTADOS[tabla] = hoy
+        telegram_send(
+            "🚨 <b>ARIA — ESCRITURA MUERTA</b>\n"
+            f"La tabla <code>{tabla}</code> lleva <b>{n} fallos seguidos</b> de escritura.\n"
+            f"Última referencia: <code>{ref[:40]}</code>\n\n"
+            "Esto es exactamente lo que dejó <code>call_intelligence</code> muerta 4 meses "
+            "en 2026. Revisar esquema, tipos y permisos AHORA."
+        )
+        log.error(f"ALERTA ENVIADA: escritura muerta en {tabla} ({n} fallos)")
+    except Exception as e:  # una alarma jamás puede tumbar el flujo principal
+        log.error(f"_alerta_escritura_muerta falló: {e}")
+
+
+def _escritura_ok(tabla: str) -> None:
+    """Resetea el contador cuando una escritura vuelve a funcionar."""
+    if _FALLOS_ESCRITURA.get(tabla):
+        _FALLOS_ESCRITURA[tabla] = 0
+
+
+# ============================================================
 # DETECTOR DETERMINÍSTICO DE BUZÓN (ARIA 2.0 · 2026-08-02)
 # ============================================================
 # POR QUÉ: el 90% del volumen son buzones de voz. Hoy cada uno paga un análisis
@@ -1017,6 +1170,28 @@ def _process_call_inner(call_data: dict, already_audited: set, call_id: str, sil
     started_at = call_data.get("startedAt")
     ended_at = call_data.get("endedAt")
 
+    # ── ARIA 2.0 · A2 (2026-08-03) — SANEAR LOS ERRORES DEL LLM
+    # LECCIÓN V1 #6 (whitelist) + #5 (lo determinístico va en código, no en el prompt).
+    # v1 tenía whitelist para `aria_outcome` pero NINGUNA para `errors_detected`:
+    # el modelo inventó 2 tipos fuera del manual. Y el propio prompt dice que en
+    # llamadas salientes NO se marque `premature_greeting`, ni `premature_endcall`
+    # cuando el resultado es `no_contesto` — pero el LLM ignoraba sus excepciones:
+    # 1.767 + 462 casos, ~95% en llamadas sin respuesta = 70% del "top errores" era ruido.
+    # Aquí esas excepciones dejan de ser una súplica al prompt y pasan a ser código.
+    errores_saneados, errores_descartados = _sanear_errores(
+        audit_result.get("errors_detected", []), aria_outcome, call_type
+    )
+    if errores_descartados:
+        log.info("[" + call_id + "] errores descartados por regla determinística: "
+                 + ", ".join(errores_descartados))
+
+    # ── ARIA 2.0 · A3 — PERSISTIR EL BOT/TRATAMIENTO
+    # LECCIÓN V1 #10: lo que se calcula y se tira es trabajo pagado y perdido.
+    # `_get_treatment_from_call()` ya resolvía el tratamiento (se usa para el prompt
+    # y para Telegram) pero NUNCA se guardaba → imposible saber si LHR performa peor
+    # que Botox. `call_audits` no tiene columna de tratamiento y no puedo hacer DDL,
+    # así que va dentro de `raw_vapi_data` (jsonb que ya existe): consultable con
+    # `raw_vapi_data->>treatment=eq.botox`, cero migración, cero riesgo.
     audit_record = {
         "vapi_call_id": call_id,
         "ghl_contact_id": ghl_contact_id,
@@ -1038,7 +1213,7 @@ def _process_call_inner(call_data: dict, already_audited: set, call_id: str, sil
         "language_switch_detected": audit_result.get("language_switch_detected", False),
         "objection_handled": audit_result.get("objection_handled"),
         "appointment_offered": audit_result.get("appointment_offered"),
-        "errors_detected": audit_result.get("errors_detected", []),
+        "errors_detected": errores_saneados,
         "transcript_text": call_data.get("transcript", "")[:5000] if call_data.get("transcript") else None,
         "audio_url": call_data.get("recordingUrl"),
         "audit_model": AUDIT_MODEL,
@@ -1048,17 +1223,37 @@ def _process_call_inner(call_data: dict, already_audited: set, call_id: str, sil
             "endedReason": call_data.get("endedReason"),
             "status": call_data.get("status"),
             "cost": call_data.get("cost"),
+            # A3: identidad del bot — permite segmentar por tratamiento (antes imposible)
+            "treatment": treatment_key,
+            "assistant_id": call_data.get("assistantId"),
+            "call_type": call_type,          # inbound/outbound: contexto que el juez no recibía
+            # A2: trazabilidad de lo saneado (nunca se pierde información en silencio)
+            "errores_descartados": errores_descartados or None,
+            "quality_notes": audit_result.get("quality_notes"),   # LECCIÓN #10: se pagaba y se tiraba
         }
     }
 
     saved = supabase_upsert("call_audits", audit_record)
+    if saved:
+        _escritura_ok("call_audits")
+    else:
+        log.error("❌ call_audits NO se guardó [" + str(call_id) + "] — se re-auditará y volverá a pagar LLM")
+        _alerta_escritura_muerta("call_audits", str(call_id))
 
     # Guardar inteligencia de cliente en tabla separada
+    # ── ARIA 2.0 FIX (2026-08-03) · LECCIÓN V1 #2: la forma del dato se verifica
+    # contra el esquema REAL. `call_intelligence.audit_id` es BIGINT y aquí se le
+    # metía `call_audits.id` que es UUID → PostgREST rechazaba con 22P02, el upsert
+    # devolvía None y NADIE MIRABA EL RETORNO (lección #1). Resultado: la tabla
+    # quedó MUERTA desde 2026-04-04 — 374 conversaciones reales sin extraer una sola
+    # objeción, mientras call_audits crecía a 6.472 filas.
+    # La llave real entre ambas tablas es `vapi_call_id` (text en las dos), que ya
+    # se guarda y es el on_conflict del upsert. `audit_id` NO se escribe: es un
+    # campo legacy incompatible (las 32 filas que existen lo tienen NULL).
     client_intel = audit_result.get("client_intelligence")
     if saved and client_intel and client_intel.get("call_type") == "real_conversation":
         intel_record = {
             "vapi_call_id": call_id,
-            "audit_id": saved.get("id"),
             "call_type": client_intel.get("call_type"),
             "language": client_intel.get("language"),
             "interest_level": client_intel.get("interest_level"),
@@ -1076,8 +1271,14 @@ def _process_call_inner(call_data: dict, already_audited: set, call_id: str, sil
             "phone_number": phone,
             "ghl_contact_id": ghl_contact_id,
         }
-        supabase_upsert("call_intelligence", intel_record, on_conflict="vapi_call_id")
-        log.info("Client intelligence saved [" + call_id + "]: stage=" + str(client_intel.get("buying_stage")) + " interest=" + str(client_intel.get("interest_level")))
+        # LECCIÓN V1 #1: ninguna escritura falla en silencio. Se verifica el retorno
+        # y se alerta si falla — así una avería como la de abril dura horas, no 4 meses.
+        _intel_saved = supabase_upsert("call_intelligence", intel_record, on_conflict="vapi_call_id")
+        if _intel_saved:
+            log.info("Client intelligence saved [" + call_id + "]: stage=" + str(client_intel.get("buying_stage")) + " interest=" + str(client_intel.get("interest_level")))
+        else:
+            log.error("❌ CALL_INTELLIGENCE NO SE GUARDÓ [" + call_id + "] — la mina de objeciones se está perdiendo. Revisar esquema/permisos.")
+            _alerta_escritura_muerta("call_intelligence", call_id)
 
     # Casos que ARIA auto-aprueba sin pedir confirmación a Juan
     AUTO_APPROVE_CASES = {
@@ -1350,7 +1551,7 @@ def _build_report_from_vapi(utc_start: str, utc_end: str, label: str, chat_id: s
     - Registra no_contesto automático para las sin transcript
     - Usa Supabase (aria_outcome) para outcomes y errores
     """
-    vapi_calls = fetch_vapi_calls_range(utc_start, utc_end, limit=500)
+    vapi_calls = fetch_vapi_calls_range_todos(utc_start, utc_end, limit=500)   # A4: los 7 bots, no solo Botox
     ended_calls = [c for c in vapi_calls if c.get("status") == "ended"]
     vapi_total = len(ended_calls)
 
@@ -1390,8 +1591,37 @@ def _build_report_from_vapi(utc_start: str, utc_end: str, label: str, chat_id: s
         "metrics": metrics,
         "top_errors": top_errors,
         "score": score,
-        "coverage_pct": round(len(results) / vapi_total * 100) if vapi_total > 0 else 0,
+        "coverage_pct": _cobertura(len(results), vapi_total),
+        # A4: reparto por bot — antes era imposible saber si LHR performa peor que Botox
+        "por_tratamiento": _reparto_por_tratamiento(ended_calls),
     }
+
+
+def _cobertura(auditadas: int, total_vapi: int) -> int:
+    """Cobertura con INVARIANTE. ARIA 2.0 · LECCIÓN V1 #7.
+
+    Un porcentaje sin invariante miente sin que nadie lo note: v1 comparaba las
+    llamadas de Botox contra TODAS las de Supabase y devolvía >100% sin inmutarse.
+    Una cobertura imposible es la señal de que el reporte está mal construido.
+    """
+    if total_vapi <= 0:
+        return 0
+    pct = round(auditadas / total_vapi * 100)
+    if pct > 105:      # margen por llamadas en vuelo entre ambas consultas
+        log.error(
+            f"🚨 COBERTURA IMPOSIBLE: {pct}% ({auditadas} auditadas vs {total_vapi} en Vapi). "
+            "El reporte está comparando universos distintos — revisar el filtro de bots."
+        )
+    return pct
+
+
+def _reparto_por_tratamiento(calls: list) -> dict:
+    """Cuántas llamadas puso cada bot en el periodo (A4)."""
+    reparto: dict = {}
+    for c in calls or []:
+        t = c.get("_treatment") or "?"
+        reparto[t] = reparto.get(t, 0) + 1
+    return dict(sorted(reparto.items(), key=lambda kv: -kv[1]))
 
 
 def _format_report_telegram(data: dict) -> str:
@@ -1620,7 +1850,7 @@ def _handle_audit(args: str, chat_id: str):
 
 def _run_audit_range(utc_start: str, utc_end: str, label: str) -> dict:
     """FIX #4: reporta nuevas + ya auditadas + sin transcript. FIX #10: no spamea notificaciones por llamada."""
-    vapi_calls = fetch_vapi_calls_range(utc_start, utc_end, limit=500)
+    vapi_calls = fetch_vapi_calls_range_todos(utc_start, utc_end, limit=500)   # A4: los 7 bots, no solo Botox
     ended_calls = [c for c in vapi_calls if c.get("status") == "ended"]
     already_audited = get_audited_ids_in_range(utc_start, utc_end)
 
@@ -2630,15 +2860,24 @@ def check_degradation_alert():
             results = _records_to_results(day_records)
             metrics = calculate_daily_metrics(results, day_label)
             scores.append(_calculate_elena_score(metrics))
+    # ── ARIA 2.0 FIX (2026-08-03) · LECCIÓN V1 #8: toda alarma se prueba forzando su condición.
+    # v1 calculaba `drop = scores[-1] - scores[0]` con scores[0]=HOY y scores[-1]=hace 2 días,
+    # es decir `pasado − hoy`. Con la condición `<= -10` la alerta disparaba cuando HOY era
+    # MEJOR: avisaba de las MEJORAS y callaba las caídas. Por eso Elena se degradó 5 meses
+    # (ofrecer cita 64% → 33%) sin una sola alerta.
+    # Correcto: variacion = hoy − pasado. Negativa = empeoró.
     if len(scores) >= 2:
-        drop = scores[-1] - scores[0]
-        if drop <= -10:
+        variacion = scores[0] - scores[-1]
+        if variacion <= -10:
             telegram_send(
                 "⚠️ <b>ALERTA DE DEGRADACIÓN</b>\n"
-                "El score de Elena bajó " + str(abs(drop)) + " puntos en 3 días.\n"
-                "Score actual: " + str(scores[0]) + "/100\n"
+                "El score de Elena bajó " + str(abs(variacion)) + " puntos en 3 días.\n"
+                "Score de hoy: " + str(scores[0]) + "/100 (hace 2 días: " + str(scores[-1]) + "/100)\n"
                 "Usa /errores para ver qué está fallando."
             )
+            log.warning("degradación detectada: " + str(scores[-1]) + " → " + str(scores[0]) + " (" + str(variacion) + ")")
+        elif variacion >= 10:
+            log.info("mejora detectada (no se alerta): " + str(scores[-1]) + " → " + str(scores[0]))
 
 
 # ============================================================
@@ -2699,7 +2938,12 @@ def run_audit(hours_back: int = None, dry_run: bool = False):
     metrics = calculate_daily_metrics(results, audit_date)
 
     if not dry_run and metrics:
-        supabase_upsert("daily_metrics", metrics, on_conflict="metric_date,agent_name")
+        _dm = supabase_upsert("daily_metrics", _payload_daily_metrics(metrics), on_conflict="metric_date,agent_name")
+        if _dm:
+            _escritura_ok("daily_metrics")
+        else:
+            log.error("❌ daily_metrics NO se guardó — métricas diarias perdidas")
+            _alerta_escritura_muerta("daily_metrics", metrics.get("metric_date", ""))
 
     if not dry_run and results:
         check_error_pattern_alert(results, audit_date)
@@ -2732,7 +2976,12 @@ def run_daily_report():
     aria_efficacy = _get_aria_efficacy(days=1)
 
     if metrics.get("total_calls", 0) > 0:
-        supabase_upsert("daily_metrics", metrics, on_conflict="metric_date,agent_name")
+        _dm = supabase_upsert("daily_metrics", _payload_daily_metrics(metrics), on_conflict="metric_date,agent_name")
+        if _dm:
+            _escritura_ok("daily_metrics")
+        else:
+            log.error("❌ daily_metrics NO se guardó — métricas diarias perdidas")
+            _alerta_escritura_muerta("daily_metrics", metrics.get("metric_date", ""))
 
     telegram_send_daily_report(metrics, audit_date, top_errors, aria_efficacy)
 
