@@ -86,6 +86,33 @@ log = logging.getLogger("aria")
 
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
+# ------------------------------------------------------------------
+# OUTCOMES · FUENTE ÚNICA DE VERDAD (FIX 2026-08-06)
+#
+# Había 3 listas divergentes en el sistema (prompt del juez / _VALID_OUTCOMES /
+# OUTCOME_LABELS) + una cuarta en el analysisPlan de Vapi. Divergieron en
+# silencio: `seguimiento_humano` (7º outcome creado el 2026-05-22 en Elena
+# Voice) nunca se agregó a la whitelist de ARIA, así que si llegaba se mapeaba
+# a None y se perdía el original.
+#
+# Medido el 2026-08-06 sobre 5.405 auditorías desde mayo: `seguimiento_humano`
+# y `numero_invalido` tienen CERO emisiones, así que hoy no se pierde nada.
+# Esto no se arregla por el daño actual (no lo hay) sino para que no vuelvan a
+# divergir en silencio: una sola constante + fallo RUIDOSO si alguien agrega un
+# outcome y olvida su etiqueta.
+#
+# Doctrina de Juan (2026-04): outcomes = ramas de workflow; razones = tags de
+# metadata, nunca se mezclan. Estos 6 son los que él definió.
+# ------------------------------------------------------------------
+OUTCOMES_ARIA = (
+    "agendo",
+    "no_agendo",
+    "no_contesto",
+    "llamar_luego",
+    "error_tecnico",
+    "no_interesado",
+)
+
 OUTCOME_LABELS = {
     "agendo": "✅ Agendó",
     "no_agendo": "📋 No agendó",
@@ -93,8 +120,21 @@ OUTCOME_LABELS = {
     "llamar_luego": "🔄 Llamar luego",
     "error_tecnico": "⚙️ Error técnico",
     "no_interesado": "🚫 No interesado",
+    # Emitidos por el ORIGEN (Vapi/GHL), nunca por ARIA. Se etiquetan para poder
+    # mostrarlos en reportes, pero no entran en la whitelist de ARIA.
     "numero_invalido": "🚫 Número inválido",
+    "seguimiento_humano": "🙋 Seguimiento humano",
 }
+
+# Invariante: todo outcome que ARIA puede emitir DEBE tener etiqueta. Si alguien
+# agrega uno a OUTCOMES_ARIA y olvida la etiqueta, esto revienta al importar el
+# módulo — ruidoso el día 1, en vez de un reporte con un outcome sin nombre.
+_sin_etiqueta = [o for o in OUTCOMES_ARIA if o not in OUTCOME_LABELS]
+if _sin_etiqueta:
+    raise RuntimeError(
+        f"OUTCOMES_ARIA sin etiqueta en OUTCOME_LABELS: {_sin_etiqueta}. "
+        "Agrega su etiqueta — no dejes que un outcome viaje sin nombre."
+    )
 
 # ============================================================
 # HELPERS DE FECHA — FIX #1: usar strftime, NUNCA isoformat()
@@ -349,13 +389,33 @@ def fetch_vapi_call_by_id(call_id: str) -> Optional[dict]:
     return None
 
 
-def get_already_audited_ids(limit: int = 1000) -> set:
-    """Always returns the most recent 10000 records ordered by date DESC.
-    Immune to total record count — covers ~100 days at current call volume."""
+def get_already_audited_ids(hours_back: int = 48) -> set:
+    """IDs ya auditados dentro de la ventana que el polling realmente mira.
+
+    FIX 2026-08-06 (D4). Antes pedía `limit=10000` con el docstring
+    "covers ~100 days": las dos cosas eran falsas. PostgREST tope real = 1.000
+    filas, así que devolvía 1.000 (≈14 días a 71 llamadas/día, no 100), y esto
+    corre cada 3 minutos → hasta 1.000 filas transferidas 480 veces al día para
+    compararlas contra las ~8-70 llamadas que trae el polling.
+
+    El polling pide a Vapi las últimas 25h (`fetch_vapi_calls(hours_back=25)`),
+    así que basta con los IDs de las últimas 48h — el doble de la ventana, con
+    margen de sobra para reintentos y desfases de reloj.
+
+    Si alguna vez la ventana llegara al tope de PostgREST, lo dice en voz alta
+    en vez de truncar en silencio (ése fue el bug original).
+    """
+    cutoff = _utc_cutoff(hours=hours_back)
     records = supabase_query(
         "call_audits",
-        "select=vapi_call_id&order=created_at.desc&limit=10000"
+        f"select=vapi_call_id&created_at=gte.{cutoff}&order=created_at.desc&limit=1000"
     )
+    if len(records) >= 1000:
+        log.error(
+            f"get_already_audited_ids: {len(records)} filas en {hours_back}h — se alcanzó "
+            "el tope de PostgREST (1.000). Hay riesgo de re-auditar llamadas ya vistas: "
+            "baja hours_back o pagina."
+        )
     return {r.get("vapi_call_id") for r in records if r.get("vapi_call_id")}
 
 
@@ -1308,10 +1368,20 @@ def _process_call_inner(call_data: dict, already_audited: set, call_id: str, sil
     aria_outcome = audit_result.get("correct_outcome")
     aria_confidence = audit_result.get("confidence", 0.0)
 
-    # FIX 23514: sanitizar outcomes — solo valores permitidos por constraint valid_outcome
-    _VALID_OUTCOMES = {'agendo', 'no_agendo', 'no_contesto', 'llamar_luego', 'error_tecnico', 'no_interesado', None}
+    # FIX 23514: sanitizar outcomes — solo valores permitidos por constraint valid_outcome.
+    # FIX 2026-08-06: la lista se DERIVA de OUTCOMES_ARIA (fuente única, arriba) en vez
+    # de estar hardcodeada aquí — era una de las 3 listas que divergían en silencio.
+    # El constraint de la DB no acepta otros valores y la key es read-only (no hay DDL),
+    # así que seguimos mapeando a None... pero YA NO SE PIERDE el valor: se guarda en
+    # raw_vapi_data.outcomes_descartados y el log pasa de warning a error.
+    _VALID_OUTCOMES = set(OUTCOMES_ARIA) | {None}
+    outcomes_descartados = {}
     if aria_outcome not in _VALID_OUTCOMES:
-        log.warning(f"aria_outcome inválido '{aria_outcome}' → mapeado a None")
+        log.error(
+            f"aria_outcome inválido '{aria_outcome}' → mapeado a None. "
+            f"Válidos: {sorted(OUTCOMES_ARIA)}. Valor preservado en raw_vapi_data."
+        )
+        outcomes_descartados["aria_outcome"] = aria_outcome
         aria_outcome = None
 
     ghl_fields = {}
@@ -1319,7 +1389,14 @@ def _process_call_inner(call_data: dict, already_audited: set, call_id: str, sil
         ghl_fields = get_ghl_contact_fields(ghl_contact_id)
         original_outcome = ghl_fields.get("elena_last_outcome")
         if original_outcome not in _VALID_OUTCOMES:
-            log.warning(f"original_outcome inválido '{original_outcome}' de GHL → mapeado a None")
+            # Aquí vive el caso `seguimiento_humano` (7º outcome de Elena Voice,
+            # 2026-05-22, que nunca se agregó a ARIA). Cero emisiones medidas al
+            # 2026-08-06, pero si llega ya no desaparece sin rastro.
+            log.error(
+                f"original_outcome inválido '{original_outcome}' de GHL → mapeado a None. "
+                "Valor preservado en raw_vapi_data."
+            )
+            outcomes_descartados["original_outcome"] = original_outcome
             original_outcome = None
 
     has_discrepancy = (
@@ -1394,6 +1471,9 @@ def _process_call_inner(call_data: dict, already_audited: set, call_id: str, sil
             # A2: trazabilidad de lo saneado (nunca se pierde información en silencio)
             "errores_descartados": errores_descartados or None,
             "quality_notes": audit_result.get("quality_notes"),   # LECCIÓN #10: se pagaba y se tiraba
+            # FIX 2026-08-06 (D3): outcome que el constraint de la DB no acepta
+            # (p. ej. seguimiento_humano). Antes se mapeaba a None y desaparecía.
+            "outcomes_descartados": outcomes_descartados or None,
         }
     }
 
