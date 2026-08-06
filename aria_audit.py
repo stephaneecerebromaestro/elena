@@ -684,32 +684,95 @@ Si es "voicemail" o "short_rejection", devuelve client_intelligence: null.
 """
 
 
+# ------------------------------------------------------------------
+# FEW-SHOT · FIX 2026-08-06 — el bucle auto-confirmatorio
+#
+# Medido el 2026-08-06 sobre feedback_log completo (n=378):
+#   · 361 aprobados vs 17 rechazados = 95,5% de aprobación. Tomar "los 20
+#     más recientes por fecha" producía 10 ejemplos que casi siempre decían
+#     "ARIA tiene razón" → ARIA se entrenaba a darse la razón.
+#   · Los 361 aprobados contienen solo 16 pares (GHL→ARIA) distintos, y los
+#     dos más comunes (no_contesto→llamar_luego 101, no_agendo→no_contesto 92)
+#     son más de la mitad → los 10 ejemplos repetían ~3 lecciones.
+#   · Los 16 rechazos son la señal MÁS valiosa (ahí ARIA se equivocó) y casi
+#     todos son el error #1 del sistema: ARIA=no_agendo cuando era no_contesto.
+#
+# Ahora: mitad rechazados / mitad aprobados, deduplicando por par para que
+# cada ejemplo enseñe algo DISTINTO. Mismo presupuesto de tokens, más señal.
+# Se cachea porque esto se llama en CADA auditoría y el feedback cambia poco.
+# ------------------------------------------------------------------
+_FEWSHOT_TTL_SEG = 900  # 15 min
+_fewshot_cache = {"ts": 0.0, "data": None}
+
+
+def _dedup_por_par(rows: list) -> list:
+    """Un ejemplo por par (GHL→ARIA); se queda con el más reciente."""
+    vistos, out = set(), []
+    for r in rows:
+        clave = (r.get("original_outcome"), r.get("aria_outcome"))
+        if clave in vistos:
+            continue
+        vistos.add(clave)
+        out.append(r)
+    return out
+
+
 def get_recent_feedback(limit: int = 10) -> list:
+    """Ejemplos few-shot BALANCEADOS y sin pares repetidos (ver bloque de arriba)."""
+    ahora = _time.time()
+    if _fewshot_cache["data"] is not None and (ahora - _fewshot_cache["ts"]) < _FEWSHOT_TTL_SEG:
+        return _fewshot_cache["data"][:limit]
     try:
         rows = supabase_query(
             "feedback_log",
             "select=feedback_type,original_outcome,aria_outcome,final_outcome,vapi_call_id"
-            "&order=created_at.desc&limit=20"
+            "&order=created_at.desc&limit=500"
         )
-        examples = []
+        validos = []
         for r in rows:
             if not all([r.get("original_outcome"), r.get("aria_outcome"), r.get("final_outcome")]):
                 continue
             call_id = r.get("vapi_call_id", "") or ""
             if call_id.startswith("test-") or call_id.startswith("audit-test"):
                 continue
-            examples.append({
+            validos.append({
                 "feedback_type": r.get("feedback_type"),
                 "original_outcome": r.get("original_outcome"),
                 "aria_outcome": r.get("aria_outcome"),
                 "final_outcome": r.get("final_outcome"),
             })
-            if len(examples) >= limit:
+
+        rechazados = _dedup_por_par([r for r in validos if r["feedback_type"] == "rejected"])
+        aprobados = _dedup_por_par([r for r in validos if r["feedback_type"] != "rejected"])
+
+        # Mitad y mitad; si un lado no llena su cuota, el otro la completa.
+        cuota = max(1, limit // 2)
+        elegidos = rechazados[:cuota]
+
+        # Dedup GLOBAL: un par que ya enseñó un RECHAZO no se repite como
+        # aprobación. Si no, el mismo par (GHL→ARIA) aparecería con dos
+        # lecciones opuestas ("ARIA tiene razón" y "NO cambiar") y el modelo
+        # recibiría información contradictoria — el few-shot no ve el
+        # transcript, así que no puede distinguir los dos casos.
+        # Gana el rechazo: es la señal escasa y es el error a no repetir.
+        usados = {(e["original_outcome"], e["aria_outcome"]) for e in elegidos}
+        for a in aprobados:
+            if len(elegidos) >= limit:
                 break
-        return examples
+            if (a["original_outcome"], a["aria_outcome"]) in usados:
+                continue
+            usados.add((a["original_outcome"], a["aria_outcome"]))
+            elegidos.append(a)
+
+        _fewshot_cache["data"] = elegidos
+        _fewshot_cache["ts"] = ahora
+        n_rej = sum(1 for e in elegidos if e["feedback_type"] == "rejected")
+        log.info(f"Few-shot: {len(elegidos)} ejemplos ({n_rej} rechazados / "
+                 f"{len(elegidos) - n_rej} aprobados) de {len(validos)} válidos")
+        return elegidos
     except Exception as e:
         log.warning(f"Few-shot: no se pudo cargar feedback_log: {e}")
-        return []
+        return _fewshot_cache["data"][:limit] if _fewshot_cache["data"] else []
 
 
 def build_fewshot_block(examples: list) -> str:
@@ -722,7 +785,17 @@ def build_fewshot_block(examples: list) -> str:
         "llamar_luego": "pidió que lo llamen después",
         "no_interesado": "rechazó el servicio explícitamente",
     }
+    # Los RECHAZOS van primero y se anuncian: son los casos donde ARIA se
+    # equivocó y por tanto la señal más valiosa (FIX 2026-08-06 — antes iban
+    # mezclados por fecha y quedaban ahogados por un 95,5% de aprobaciones).
+    examples = sorted(examples, key=lambda e: e.get("feedback_type") != "rejected")
+    n_rej = sum(1 for e in examples if e.get("feedback_type") == "rejected")
     lines = ["\n## DECISIONES PREVIAS DE JUAN (aprende de estos ejemplos):\n"]
+    if n_rej:
+        lines.append(
+            "⚠️ Los primeros " + str(n_rej) + " son RECHAZOS: casos donde ARIA se equivocó y "
+            "Juan revirtió la corrección. Presta especial atención — son el error a NO repetir.\n"
+        )
     for i, ex in enumerate(examples, 1):
         fb_type = ex["feedback_type"]
         orig = ex["original_outcome"]
