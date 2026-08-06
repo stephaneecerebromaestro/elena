@@ -1071,15 +1071,51 @@ def es_buzon_inequivoco(call_data: dict) -> bool:
     return bool(_BUZON_MAQUINA.search(lado_cliente))
 
 
+# FIX 2026-08-06 — el gate ignoraba la DURACIÓN y se tragaba conversaciones reales.
+# Caso real detectado en producción: llamada de 92s, endedReason=customer-ended-call,
+# transcript vacío → se marcó no_contesto con confianza 1.0. Medido: 1 de 15
+# auto-clasificaciones (6,7%). Una llamada larga sin transcript NO es "no contestó":
+# es fallo de transcripción o conversación real, y clasificarla así la saca del
+# denominador de conversión y la devuelve al workflow de re-llamada.
+# El audit del 2026-08-01 (§11, tarea 1.1) pedía 3 condiciones; se implementó 1.
+_MAX_SEG_SIN_TRANSCRIPT = 20  # alineado con la definición de "conversación real" de MEDICION.md
+
+
+def duracion_segundos(call_data: dict) -> int:
+    """Duración en segundos de una llamada de Vapi. Fuente única de verdad.
+
+    Fallback a createdAt cuando startedAt/endedAt vienen vacíos (buzones y
+    no-answer inmediatos en Vapi). Devuelve 0 si no hay señal de tiempo.
+    """
+    created_at = call_data.get("createdAt") or call_data.get("created_at")
+    started_at = call_data.get("startedAt") or created_at
+    ended_at = call_data.get("endedAt") or created_at
+    if started_at and ended_at and started_at != ended_at:
+        try:
+            s = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+            e = datetime.fromisoformat(str(ended_at).replace("Z", "+00:00"))
+            return max(0, int((e - s).total_seconds()))
+        except Exception:
+            return 0
+    return 0
+
+
 def sin_conversacion_real(call_data: dict) -> bool:
     """Gate de pre-filtro: ¿esta llamada merece gastar un análisis de Claude?
 
     Dos casos, ambos verificados contra 4.874 llamadas reales:
-      1. transcript casi vacío (<50 chars) — el criterio que ya existía.
-      2. buzón inequívoco por patrón — nuevo, y más preciso que el LLM.
+      1. transcript casi vacío (<50 chars) **Y la llamada fue corta** (<=20s).
+         La condición de duración es el FIX del 2026-08-06: sin ella, una llamada
+         larga sin transcript se auto-clasificaba como no_contesto.
+      2. buzón inequívoco por patrón — mira el CONTENIDO, así que vale a cualquier
+         duración (una máquina que recita 40s sigue siendo una máquina).
     """
+    if es_buzon_inequivoco(call_data):
+        return True
     transcript = call_data.get("transcript", "") or ""
-    return len(transcript) < 50 or es_buzon_inequivoco(call_data)
+    if len(transcript) < 50:
+        return duracion_segundos(call_data) <= _MAX_SEG_SIN_TRANSCRIPT
+    return False
 
 
 # ============================================================
@@ -1101,14 +1137,8 @@ def register_no_contesto(call_data: dict) -> Optional[dict]:
     started_at = call_data.get("startedAt") or created_at
     ended_at = call_data.get("endedAt") or created_at
     ended_reason = call_data.get("endedReason", "")
-    duration_seconds = 0  # default 0 para llamadas sin conexión real
-    if started_at and ended_at and started_at != ended_at:
-        try:
-            s = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
-            e = datetime.fromisoformat(ended_at.replace("Z", "+00:00"))
-            duration_seconds = max(0, int((e - s).total_seconds()))
-        except Exception:
-            pass
+    # Fuente única de verdad (antes esta lógica estaba duplicada aquí y en el gate).
+    duration_seconds = duracion_segundos(call_data)
 
     record = {
         "vapi_call_id": call_id,
