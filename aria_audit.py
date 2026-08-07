@@ -488,19 +488,38 @@ def get_ghl_contact_fields(contact_id: str) -> dict:
     return elena_fields
 
 
-def update_ghl_contact_outcome(contact_id: str, new_outcome: str) -> bool:
+def update_ghl_contact_outcome_detallado(contact_id: str, new_outcome: str):
+    """Actualiza el outcome en GHL y devuelve (ok, status_code_real, body).
+
+    FIX 2026-08-06 (D7): antes esto solo devolvía un bool y quien lo llamaba
+    FABRICABA el código de respuesta (`200 if success else 500`), así que
+    `aria_corrections.ghl_response_code` no guardaba lo que GHL contestó de
+    verdad — imposible diagnosticar un fallo después. Ahora se propaga el real.
+    Una excepción de red devuelve (False, None, mensaje) en vez de propagarse
+    y tumbar la aplicación de la corrección.
+    """
     _ghl_pit = os.environ.get("GHL_PIT") or GHL_PIT
-    r = requests.put(
-        f"https://services.leadconnectorhq.com/contacts/{contact_id}",
-        headers={"Authorization": f"Bearer {_ghl_pit}", "Version": "2021-07-28", "Content-Type": "application/json"},
-        json={"customFields": [{"key": "elena_last_outcome", "field_value": new_outcome}]},
-        timeout=10
-    )
+    try:
+        r = requests.put(
+            f"https://services.leadconnectorhq.com/contacts/{contact_id}",
+            headers={"Authorization": f"Bearer {_ghl_pit}", "Version": "2021-07-28", "Content-Type": "application/json"},
+            json={"customFields": [{"key": "elena_last_outcome", "field_value": new_outcome}]},
+            timeout=10
+        )
+    except Exception as e:
+        log.error(f"GHL update EXCEPCIÓN [{contact_id}]: {e}")
+        return False, None, f"excepción: {e}"[:300]
     if r.status_code in (200, 201):
         log.info(f"GHL update successful for contact {contact_id}")
-        return True
+        return True, r.status_code, "OK"
     log.error(f"GHL update failed [{contact_id}]: {r.status_code} — {r.text[:200]}")
-    return False
+    return False, r.status_code, r.text[:300]
+
+
+def update_ghl_contact_outcome(contact_id: str, new_outcome: str) -> bool:
+    """Wrapper booleano — mantiene la firma que ya usaban otros call sites."""
+    ok, _, _ = update_ghl_contact_outcome_detallado(contact_id, new_outcome)
+    return ok
 
 
 def _to_bool(value) -> Optional[bool]:
@@ -1640,10 +1659,11 @@ def apply_correction(correction_id: str, approved: bool, feedback_notes: str = "
     ghl_response_code = None
     ghl_response_body = None
     if approved:
-        success = update_ghl_contact_outcome(ghl_contact_id, new_value)
+        # FIX 2026-08-06 (D7): se guarda el código REAL de GHL, no uno fabricado.
+        success, ghl_response_code, ghl_response_body = update_ghl_contact_outcome_detallado(
+            ghl_contact_id, new_value
+        )
         new_status = "applied" if success else "pending"
-        ghl_response_code = 200 if success else 500
-        ghl_response_body = "OK" if success else "GHL update failed"
         if success:
             supabase_update("call_audits", {"id": audit_id}, {"audit_status": "feedback_approved"})
     else:
@@ -1651,19 +1671,51 @@ def apply_correction(correction_id: str, approved: bool, feedback_notes: str = "
         success = True
         supabase_update("call_audits", {"id": audit_id}, {"audit_status": "feedback_rejected"})
     supabase_update("aria_corrections", {"id": correction_id}, {"correction_status": new_status, "ghl_response_code": ghl_response_code, "ghl_response_body": ghl_response_body})
+    # FIX 2026-08-06 (D7) — feedback_log decía que la corrección se había aplicado
+    # aunque GHL la hubiera rechazado: escribía final_outcome=new_value siempre que
+    # Juan aprobara. Resultado: la métrica de eficacia y GHL divergían, y —peor— el
+    # FEW-SHOT lee esta tabla, así que ARIA aprendía de un desenlace que nunca ocurrió.
+    #
+    # Se separan dos cosas que estaban mezcladas:
+    #   · feedback_type = el JUICIO de Juan. Sigue siendo "approved" aunque GHL falle:
+    #     Juan sí dijo que ARIA tenía razón, y ese criterio es válido para aprender.
+    #   · final_outcome = el estado REAL del contacto en GHL. Si GHL falló, el contacto
+    #     sigue con old_value, y eso es lo que se guarda.
+    aplicado_de_verdad = approved and success
+    final_real = new_value if aplicado_de_verdad else old_value
+    nota_base = feedback_notes or (
+        "Telegram: " + ("aprobado" if approved else "rechazado") + " por Juan"
+    )
+    if approved and not success:
+        nota_base += (
+            f" | ⚠️ GHL NO aplicó el cambio (código {ghl_response_code}): el contacto "
+            f"sigue en '{old_value}' y la corrección quedó pending."
+        )
     feedback_record = {
         "audit_id": audit_id, "vapi_call_id": vapi_call_id,
         "feedback_type": "approved" if approved else "rejected",
         "feedback_source": "telegram",
         "original_outcome": old_value, "aria_outcome": new_value,
-        "final_outcome": new_value if approved else old_value,
-        "notes": feedback_notes or ("Telegram: " + ("aprobado" if approved else "rechazado") + " por Juan")
+        "final_outcome": final_real,
+        "notes": nota_base,
     }
-    supabase_insert("feedback_log", feedback_record)
+    if not supabase_insert("feedback_log", feedback_record):
+        # No tragarse el fallo: sin esta fila, el few-shot pierde el criterio de Juan.
+        log.error(
+            f"feedback_log NO se guardó para la corrección {correction_id} — "
+            "el juicio de Juan se perdió para el aprendizaje de ARIA."
+        )
     if approved and success:
         msg = "✅ <b>Corrección aplicada en GHL</b>\n<code>" + (vapi_call_id[:20] if vapi_call_id else "N/A") + "...</code>\nOutcome actualizado: <b>" + old_value + "</b> → <b>" + new_value + "</b>"
     elif approved and not success:
-        msg = "⚠️ <b>Error al aplicar corrección en GHL</b>\nLa corrección fue aprobada pero GHL devolvió un error."
+        msg = (
+            "⚠️ <b>GHL NO aplicó la corrección</b>\n"
+            "<code>" + (vapi_call_id[:20] if vapi_call_id else "N/A") + "...</code>\n"
+            "Tú la aprobaste (<b>" + str(old_value) + "</b> → <b>" + str(new_value) + "</b>), "
+            "pero GHL respondió <b>" + str(ghl_response_code) + "</b>.\n"
+            "El contacto sigue en <b>" + str(old_value) + "</b> y la corrección quedó "
+            "<b>pending</b> — se puede reintentar."
+        )
     else:
         msg = "❌ <b>Corrección rechazada</b>\n<code>" + (vapi_call_id[:20] if vapi_call_id else "N/A") + "...</code>\nSe mantiene la clasificación original: <b>" + old_value + "</b>"
     telegram_send(msg)
