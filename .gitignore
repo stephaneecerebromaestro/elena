@@ -9,3 +9,9 @@ venv/
 # backups locales de la Fase 0 ARIA 2.0 (no versionar: son snapshots grandes)
 prompts_backup_*/
 vapi_assistants_backup_*/
+
+# ── Higiene 2026-08-24 (los 11 pendientes, #4) ──────────────────────────────
+# Datos generados, no código: no viajan en el repo.
+backups/
+*.bak.*
+rollback_*.json
